@@ -1,4 +1,4 @@
-//! Anonymous huge-page-advised (`THP`) backing buffers for large zeroed tables and uninit slabs.
+//! Anonymous memory-mapped backing buffers for large zeroed tables and uninit slabs.
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::mem::{align_of, needs_drop, size_of, MaybeUninit};
@@ -26,8 +26,8 @@ impl Drop for BackingOwner {
     }
 }
 
-/// Fixed-length zero-initialized buffer using `mmap(MAP_ANONYMOUS)` + `MADV_HUGEPAGE`
-/// for allocations >= 2 MB on Linux, falling back to aligned heap allocation otherwise.
+/// Fixed-length zero-initialized buffer using `mmap(MAP_ANONYMOUS)` for allocations >= 2 MB
+/// on Linux, falling back to aligned heap allocation otherwise.
 pub struct HugeZeroed<T> {
     ptr: *mut T,
     len: usize,
@@ -55,8 +55,6 @@ impl<T> HugeZeroed<T> {
 
         if cfg!(target_os = "linux") && byte_len >= HUGE_PAGE_THRESHOLD {
             if let Ok(mut m) = MmapOptions::new().len(byte_len).map_anon() {
-                #[cfg(target_os = "linux")]
-                let _ = m.advise(memmap2::Advice::HugePage);
                 let ptr = m.as_mut_ptr() as *mut T;
                 return Self {
                     ptr,
@@ -137,8 +135,8 @@ impl<T> Deref for HugeZeroed<T> {
     }
 }
 
-/// Append-only uninitialized slab backed by `mmap(MAP_ANONYMOUS)` + `MADV_HUGEPAGE`
-/// for allocations >= 2 MB on Linux, enabling fast zero-branch pointer access.
+/// Append-only uninitialized slab backed by `mmap(MAP_ANONYMOUS)` for allocations >= 2 MB
+/// on Linux, enabling fast zero-branch pointer access.
 pub struct HugeSlab<T> {
     ptr: *mut MaybeUninit<T>,
     len: usize,
@@ -168,8 +166,6 @@ impl<T> HugeSlab<T> {
 
         if cfg!(target_os = "linux") && byte_len >= HUGE_PAGE_THRESHOLD {
             if let Ok(mut m) = MmapOptions::new().len(byte_len).map_anon() {
-                #[cfg(target_os = "linux")]
-                let _ = m.advise(memmap2::Advice::HugePage);
                 let ptr = m.as_mut_ptr() as *mut MaybeUninit<T>;
                 return Self {
                     ptr,

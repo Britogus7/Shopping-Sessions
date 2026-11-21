@@ -1,7 +1,87 @@
 //! Spec-exact SIMD CSV scanner, L1 window date table,
 //! and SWAR timestamp / price parsers.
 
+use std::fs::File;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 pub const DAY_MS: i64 = 86_400_000;
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+}
+
+/// Hint sequential kernel readahead (`POSIX_FADV_SEQUENTIAL = 2`) for sequential chunk reads.
+#[inline]
+pub fn fadvise_sequential(f: &File) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = posix_fadvise(f.as_raw_fd(), 0, 0, 2);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = f;
+}
+
+#[cfg(unix)]
+#[inline]
+fn read_at_full(file: &File, dst: &mut [u8], file_off: usize) -> usize {
+    let mut got = 0usize;
+    while got < dst.len() {
+        match file.read_at(&mut dst[got..], (file_off + got) as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("read_at failed: {e}"),
+        }
+    }
+    got
+}
+
+/// Read chunk `[job_start.saturating_sub(1)..]` plus trailing bytes through the newline
+/// closing the line crossing `job_end`. Returns `(got, local_start, local_end)`.
+#[cfg(unix)]
+#[inline]
+pub fn pread_csv_chunk(
+    file: &File,
+    file_len: usize,
+    job_start: usize,
+    job_end: usize,
+    buf: &mut Vec<u8>,
+) -> (usize, usize, usize) {
+    let job_end = job_end.min(file_len);
+    if job_start >= job_end || job_start >= file_len {
+        return (0, 0, 0);
+    }
+    let read_start = job_start.saturating_sub(1);
+    let local_start = job_start - read_start;
+    let local_end = job_end - read_start;
+    let mut read_end = (job_end + 4096).min(file_len);
+    let need = read_end - read_start;
+    if buf.len() < need {
+        buf.resize(need, 0);
+    }
+    let mut got = read_at_full(file, &mut buf[..need], read_start);
+    if got < local_end {
+        return (got, local_start.min(got), got);
+    }
+    while read_end < file_len && memchr::memchr(b'\n', &buf[local_end - 1..got]).is_none() {
+        let extra_end = (read_end + 16_384).min(file_len);
+        let new_need = extra_end - read_start;
+        if buf.len() < new_need {
+            buf.resize(new_need, 0);
+        }
+        let n = read_at_full(file, &mut buf[got..new_need], read_start + got);
+        got += n;
+        read_end = extra_end;
+        if got < new_need || n == 0 {
+            break;
+        }
+    }
+    (got, local_start, local_end)
+}
 pub const SESSION_GAP_MS: i64 = 1_800_000;
 pub const CLICK_REACH_MS: i64 = 7 * DAY_MS;
 pub const LATE_LIMIT_MS: i64 = DAY_MS;
@@ -1304,5 +1384,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pread_csv_chunk_matches_mmap_across_boundaries() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("shopping_pread_chunk_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.csv");
+
+        let long_field = "X".repeat(5000);
+        let mut content = String::from("a,b,c\n");
+        for i in 0..120usize {
+            match i % 6 {
+                0 => content.push_str(&format!("\"u_{i}\",mid,\"p_{i}\"\n")),
+                1 => content.push_str(&format!("u_{i},\"bad\"q,p_{i}\n")),
+                2 => content.push_str("\n"),
+                3 if i == 63 => content.push_str(&format!("{long_field},\"ok\",end_{i}\n")),
+                4 => content.push_str("a,b,c,d\n"),
+                _ => content.push_str(&format!("u_{i},v_{i},p_{i}\n")),
+            }
+        }
+        content.push_str("last_u,last_v,last_p");
+        {
+            let mut w = File::create(&path).unwrap();
+            w.write_all(content.as_bytes()).unwrap();
+        }
+
+        let bytes = content.as_bytes();
+        let mut expected: Vec<[Vec<u8>; 3]> = Vec::new();
+        for_each_data_line(bytes, true, |l| {
+            if let Some([a, b, c]) = parse_csv_line::<3>(l) {
+                expected.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+            }
+        });
+
+        let f = File::open(&path).unwrap();
+        fadvise_sequential(&f);
+        let flen = f.metadata().unwrap().len() as usize;
+        let mut io_buf = Vec::new();
+
+        for &chunk_sz in &[17usize, 64, 256, 4096, flen] {
+            let mut got = Vec::new();
+            let mut pos = 0usize;
+            while pos < flen {
+                let end = (pos + chunk_sz).min(flen);
+                let (n, ls, le) = pread_csv_chunk(&f, flen, pos, end, &mut io_buf);
+                if n > 0 {
+                    scan_csv_mmap_chunk::<3, _>(&io_buf[..n], ls, le, |&[a, b, c]| {
+                        got.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+                    });
+                }
+                pos = end;
+            }
+            assert_eq!(got, expected, "pread mismatch for chunk_sz={chunk_sz}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,14 +7,16 @@ use std::time::Instant;
 
 use ahash::RandomState;
 use hashbrown::{HashMap, HashTable};
-use memmap2::{Mmap, MmapOptions};
 
 use crate::csv::{
-    for_each_data_line, parse_csv_line, parse_d2, parse_f3_13_ptr, parse_hms_swar,
-    parse_ingest_fast_sec, parse_ingest_rel_sec, parse_price_cents, parse_ts, parse_ts_rel_ms,
-    parse_ts_rel_ms_and_sec, resolve_iso_day_rel_sec, scan_csv_mmap_chunk_sink, CsvRowSink,
-    FastDateCache, CLICK_REACH_MS, DAY_MS, LATE_LIMIT_MS, SESSION_GAP_MS,
+    fadvise_sequential, for_each_data_line, parse_csv_line, parse_d2, parse_f3_13_ptr,
+    parse_hms_swar, parse_ingest_fast_sec, parse_ingest_rel_sec, parse_price_cents, parse_ts,
+    parse_ts_rel_ms, parse_ts_rel_ms_and_sec, pread_csv_chunk, resolve_iso_day_rel_sec,
+    scan_csv_mmap_chunk_sink, CsvRowSink, FastDateCache, CLICK_REACH_MS, DAY_MS, LATE_LIMIT_MS,
+    SESSION_GAP_MS,
 };
+
+const IO_CHUNK_BYTES: usize = 1024 * 1024;
 use crate::huge::HugeSlab;
 use crate::links::{build_link_redirect, LinkRedirect};
 use crate::pack::{
@@ -3926,7 +3928,7 @@ fn handle_click_row(
 
 struct OpenCsvFile {
     len: usize,
-    mmap: Mmap,
+    file: File,
 }
 
 struct OpenedInputs {
@@ -3952,22 +3954,19 @@ fn build_interleaved_file_jobs(paths: &[PathBuf]) -> (Vec<OpenCsvFile>, Vec<Chun
         if len == 0 {
             continue;
         }
-        let Ok(m) = (unsafe { MmapOptions::new().map(&f) }) else {
-            continue;
-        };
-        let entry = OpenCsvFile { len, mmap: m };
+        fadvise_sequential(&f);
+        let entry = OpenCsvFile { len, file: f };
         total_bytes += len as u64;
         pairs.push((len, entry));
     }
     pairs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     let files: Vec<OpenCsvFile> = pairs.into_iter().map(|x| x.1).collect();
 
-    const CHUNK_BYTES: usize = 2 * 1024 * 1024;
     let mut jobs: Vec<ChunkJob> = Vec::new();
     for (fidx, f) in files.iter().enumerate() {
         let mut off = 0usize;
         while off < f.len {
-            let end = (off + CHUNK_BYTES).min(f.len);
+            let end = (off + IO_CHUNK_BYTES).min(f.len);
             jobs.push(ChunkJob {
                 fidx,
                 start: off,
@@ -3997,9 +3996,13 @@ fn scan_open_file_sink<const N: usize, S: CsvRowSink<N>>(
     open_file: &OpenCsvFile,
     start: usize,
     end: usize,
+    buf: &mut Vec<u8>,
     sink: &mut S,
 ) {
-    scan_csv_mmap_chunk_sink::<N, S>(&open_file.mmap, start, end, sink);
+    let (got, ls, le) = pread_csv_chunk(&open_file.file, open_file.len, start, end, buf);
+    if got > 0 {
+        scan_csv_mmap_chunk_sink::<N, S>(&buf[..got], ls, le, sink);
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
@@ -4745,6 +4748,7 @@ fn drain_event_jobs(
     extras: &mut Vec<ExtraEvent>,
     eid_staged: &mut NtSlabBuckets<RawEvent16, 4, NT_RAW_BLOCK>,
 ) {
+    let mut io_buf: Vec<u8> = vec![0u8; IO_CHUNK_BYTES + 32_768];
     loop {
         let jid = next_ev_job.fetch_add(1, MemOrdering::Relaxed);
         let Some(job) = event_jobs.get(jid) else {
@@ -4754,21 +4758,25 @@ fn drain_event_jobs(
         if use_compact_ts && date_cache.win_start_whole_sec {
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
             {
-                unsafe {
-                    scan_events_direct_compact(
-                        &open_file.mmap,
-                        job.start,
-                        job.end,
-                        date_cache,
-                        win_start,
-                        win_len_u64,
-                        products,
-                        overflow,
-                        tid,
-                        idx_bits,
-                        extras,
-                        eid_staged,
-                    );
+                let (got, ls, le) =
+                    pread_csv_chunk(&open_file.file, open_file.len, job.start, job.end, &mut io_buf);
+                if got > 0 {
+                    unsafe {
+                        scan_events_direct_compact(
+                            &io_buf[..got],
+                            ls,
+                            le,
+                            date_cache,
+                            win_start,
+                            win_len_u64,
+                            products,
+                            overflow,
+                            tid,
+                            idx_bits,
+                            extras,
+                            eid_staged,
+                        );
+                    }
                 }
                 continue;
             }
@@ -5020,7 +5028,7 @@ fn drain_event_jobs(
                 extras,
                 eid_staged,
             };
-            scan_open_file_sink::<7, _>(open_file, job.start, job.end, &mut sink);
+            scan_open_file_sink::<7, _>(open_file, job.start, job.end, &mut io_buf, &mut sink);
         } else {
             struct WideEvSink<'a> {
                 date_cache: &'a FastDateCache,
@@ -5073,7 +5081,7 @@ fn drain_event_jobs(
                 extras,
                 eid_staged,
             };
-            scan_open_file_sink::<7, _>(open_file, job.start, job.end, &mut sink);
+            scan_open_file_sink::<7, _>(open_file, job.start, job.end, &mut io_buf, &mut sink);
         }
     }
 }
@@ -5619,27 +5627,32 @@ fn drain_click_jobs(
         resolver: &mut resolver,
     };
 
+    let mut io_buf: Vec<u8> = vec![0u8; IO_CHUNK_BYTES + 32_768];
     loop {
         let jid = next_ck_job.fetch_add(1, MemOrdering::Relaxed);
         let Some(job) = click_jobs.get(jid) else {
             break;
         };
+        let cf = &click_files[job.fidx];
         if date_cache.win_start_whole_sec && !campaigns.direct.is_empty() {
-            unsafe {
-                scan_clicks_direct(
-                    &click_files[job.fidx].mmap,
-                    job.start,
-                    job.end,
-                    campaigns,
-                    date_cache,
-                    win_len_i64,
-                    overflow,
-                    links_empty,
-                    sink.resolver,
-                );
+            let (got, ls, le) = pread_csv_chunk(&cf.file, cf.len, job.start, job.end, &mut io_buf);
+            if got > 0 {
+                unsafe {
+                    scan_clicks_direct(
+                        &io_buf[..got],
+                        ls,
+                        le,
+                        campaigns,
+                        date_cache,
+                        win_len_i64,
+                        overflow,
+                        links_empty,
+                        sink.resolver,
+                    );
+                }
             }
         } else {
-            scan_open_file_sink::<4, _>(&click_files[job.fidx], job.start, job.end, &mut sink);
+            scan_open_file_sink::<4, _>(cf, job.start, job.end, &mut io_buf, &mut sink);
         }
     }
     resolver.finish();

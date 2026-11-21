@@ -8,9 +8,10 @@ use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering as MemOrdering,
 };
 
-use memmap2::{Mmap, MmapOptions};
-
-use crate::csv::{parse_csv_line, scan_csv_mmap_chunk, scan_csv_mmap_chunk_sink, CsvRowSink};
+use crate::csv::{
+    fadvise_sequential, parse_csv_line, pread_csv_chunk, scan_csv_mmap_chunk,
+    scan_csv_mmap_chunk_sink, CsvRowSink,
+};
 use crate::huge::HugeZeroed;
 use crate::pack::{
     decode_canon_val, encode_canon_val, link_hash, mix64, pack_b37_pair, pack_b37_pair_89,
@@ -943,7 +944,7 @@ fn insert_bucket6_st(
 }
 
 fn build_link_redirect_st(
-    mmaps: Vec<Mmap>,
+    files: Vec<(File, usize)>,
     jobs: Vec<(usize, usize, usize)>,
     total_link_bytes: usize,
     cap: usize,
@@ -953,6 +954,7 @@ fn build_link_redirect_st(
 ) -> LinkRedirect {
     let mut keys: HugeZeroed<u64> = HugeZeroed::new(cap);
     let mut parent: HugeZeroed<u32> = HugeZeroed::new(cap);
+    let mut io_buf: Vec<u8> = vec![0u8; 256 * 1024 + 32_768];
 
     let (overflowed, has_edges) = {
         let mut sink = LinkSinkSt {
@@ -971,8 +973,12 @@ fn build_link_redirect_st(
             if sink.overflowed {
                 break;
             }
-            scan_csv_mmap_chunk_sink::<2, _>(&mmaps[fidx], start, end, &mut sink);
-            sink.flush_tail();
+            let (ref f, flen) = files[fidx];
+            let (got, ls, le) = pread_csv_chunk(f, flen, start, end, &mut io_buf);
+            if got > 0 {
+                scan_csv_mmap_chunk_sink::<2, _>(&io_buf[..got], ls, le, &mut sink);
+                sink.flush_tail();
+            }
         }
         (sink.overflowed, sink.has_edges)
     };
@@ -980,14 +986,13 @@ fn build_link_redirect_st(
     if overflowed {
         drop(keys);
         drop(parent);
-        return build_link_redirect_fallback(&mmaps, &jobs, 1, overflow);
+        return build_link_redirect_fallback(&files, &jobs, 1, overflow);
     }
 
     if !has_edges {
         if total_link_bytes < 256 * 1024 * 1024 {
             std::mem::forget(keys);
             std::mem::forget(parent);
-            std::mem::forget(mmaps);
         }
         return LinkRedirect::empty();
     }
@@ -1094,7 +1099,6 @@ fn build_link_redirect_st(
     if total_link_bytes < 256 * 1024 * 1024 {
         std::mem::forget(keys);
         std::mem::forget(parent);
-        std::mem::forget(mmaps);
     }
 
     LinkRedirect {
@@ -1233,24 +1237,23 @@ pub fn build_link_redirect(
         return LinkRedirect::empty();
     }
 
-    let mmaps: Vec<Mmap> = link_files
+    let files: Vec<(File, usize)> = link_files
         .iter()
         .filter_map(|p| {
             let f = File::open(p).ok()?;
-            let len = f.metadata().ok()?.len();
+            let len = f.metadata().ok()?.len() as usize;
             if len == 0 {
                 return None;
             }
-            let m = unsafe { MmapOptions::new().map(&f).ok()? };
-            Some(m)
+            fadvise_sequential(&f);
+            Some((f, len))
         })
         .collect();
 
     let mut total_link_bytes = 0usize;
     let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
     const CHUNK_BYTES: usize = 256 * 1024;
-    for (fidx, m) in mmaps.iter().enumerate() {
-        let len = m.len();
+    for (fidx, &(_, len)) in files.iter().enumerate() {
         total_link_bytes += len;
         let mut pos = 0usize;
         while pos < len {
@@ -1271,7 +1274,7 @@ pub fn build_link_redirect(
 
     if nt == 1 {
         return build_link_redirect_st(
-            mmaps,
+            files,
             jobs,
             total_link_bytes,
             cap,
@@ -1292,7 +1295,7 @@ pub fn build_link_redirect(
     std::thread::scope(|s| {
         let read_nt = nt.min(jobs.len());
         let mut handles = Vec::with_capacity(read_nt);
-        let mmaps_ref = &mmaps;
+        let files_ref = &files;
         let jobs_ref = &jobs;
         let next_job_ref = &next_job;
         let keys_ref: &[AtomicU64] = &keys;
@@ -1303,6 +1306,7 @@ pub fn build_link_redirect(
 
         for _ in 0..read_nt {
             handles.push(s.spawn(move || {
+                let mut io_buf: Vec<u8> = vec![0u8; CHUNK_BYTES + 32_768];
                 let mut sink = LinkSink {
                     keys_ref,
                     parent_ref,
@@ -1324,10 +1328,14 @@ pub fn build_link_redirect(
                     let Some(&(fidx, start, end)) = jobs_ref.get(jid) else {
                         break;
                     };
-                    unsafe {
-                        scan_links_direct(&mmaps_ref[fidx], start, end, &mut sink);
+                    let (ref f, flen) = files_ref[fidx];
+                    let (got, ls, le) = pread_csv_chunk(f, flen, start, end, &mut io_buf);
+                    if got > 0 {
+                        unsafe {
+                            scan_links_direct(&io_buf[..got], ls, le, &mut sink);
+                        }
+                        sink.flush_tail();
                     }
-                    sink.flush_tail();
                 }
                 if sink.local_edges {
                     has_edges_ref.store(true, MemOrdering::Relaxed);
@@ -1342,14 +1350,13 @@ pub fn build_link_redirect(
     if overflowed.load(MemOrdering::Relaxed) {
         drop(keys);
         drop(parent);
-        return build_link_redirect_fallback(&mmaps, &jobs, nt, overflow);
+        return build_link_redirect_fallback(&files, &jobs, nt, overflow);
     }
 
     if !has_edges.load(MemOrdering::Relaxed) {
         if total_link_bytes < 256 * 1024 * 1024 {
             std::mem::forget(keys);
             std::mem::forget(parent);
-            std::mem::forget(mmaps);
         }
         return LinkRedirect::empty();
     }
@@ -1472,7 +1479,6 @@ pub fn build_link_redirect(
     if total_link_bytes < 256 * 1024 * 1024 {
         std::mem::forget(keys);
         std::mem::forget(parent);
-        std::mem::forget(mmaps);
     }
     res
 }
@@ -1565,7 +1571,7 @@ struct BucketDedupResult {
 
 #[cold]
 fn build_link_redirect_fallback(
-    mmaps: &[Mmap],
+    files: &[(File, usize)],
     jobs: &[(usize, usize, usize)],
     num_threads: usize,
     overflow: &OverflowInterner,
@@ -1578,6 +1584,7 @@ fn build_link_redirect_fallback(
         let next_job_ref = &next_job;
         for _ in 0..nt {
             handles.push(s.spawn(move || {
+                let mut io_buf: Vec<u8> = vec![0u8; 256 * 1024 + 32_768];
                 let mut edges: Vec<(u64, u64)> = Vec::new();
                 let mut key_buckets: Vec<Vec<u64>> = (0..64).map(|_| Vec::new()).collect();
                 loop {
@@ -1585,7 +1592,12 @@ fn build_link_redirect_fallback(
                     let Some(&(fidx, start, end)) = jobs.get(jid) else {
                         break;
                     };
-                    scan_csv_mmap_chunk::<2, _>(&mmaps[fidx], start, end, |&[a, b]| {
+                    let (ref f, flen) = files[fidx];
+                    let (got, ls, le) = pread_csv_chunk(f, flen, start, end, &mut io_buf);
+                    if got == 0 {
+                        continue;
+                    }
+                    scan_csv_mmap_chunk::<2, _>(&io_buf[..got], ls, le, |&[a, b]| {
                         if !a.is_empty() && !b.is_empty() {
                             let ka = overflow.encode_user(a);
                             let kb = overflow.encode_user(b);
@@ -1860,16 +1872,20 @@ mod tests {
         let lr = build_link_redirect(&[f1.clone(), f2.clone(), f3.clone()], 4, &overflow);
 
         // Also validate cold fallback produces identical redirects
-        let mmaps: Vec<Mmap> = [f1, f2, f3]
+        let files: Vec<(File, usize)> = [f1, f2, f3]
             .iter()
-            .map(|p| unsafe { MmapOptions::new().map(&File::open(p).unwrap()).unwrap() })
+            .map(|p| {
+                let f = File::open(p).unwrap();
+                let l = f.metadata().unwrap().len() as usize;
+                (f, l)
+            })
             .collect();
-        let jobs: Vec<(usize, usize, usize)> = mmaps
+        let jobs: Vec<(usize, usize, usize)> = files
             .iter()
             .enumerate()
-            .map(|(i, m)| (i, 0, m.len()))
+            .map(|(i, &(_, l))| (i, 0, l))
             .collect();
-        let lr_fb = build_link_redirect_fallback(&mmaps, &jobs, 4, &overflow);
+        let lr_fb = build_link_redirect_fallback(&files, &jobs, 4, &overflow);
 
         for checker in [&lr, &lr_fb] {
             let canon_c = overflow.encode_user(b"c000");
@@ -1998,10 +2014,11 @@ mod tests {
         assert!(lr.num_buckets >= BUCKET6_MIN_BUCKETS, "expected Bucket6 path active");
         assert_eq!(lr_st.num_buckets, lr.num_buckets, "ST Bucket6 geometry mismatch");
 
-        let mmaps: Vec<Mmap> =
-            vec![unsafe { MmapOptions::new().map(&File::open(&f).unwrap()).unwrap() }];
-        let jobs = vec![(0, 0, mmaps[0].len())];
-        let lr_fb = build_link_redirect_fallback(&mmaps, &jobs, 4, &overflow);
+        let lf = File::open(&f).unwrap();
+        let llen = lf.metadata().unwrap().len() as usize;
+        let files: Vec<(File, usize)> = vec![(lf, llen)];
+        let jobs = vec![(0, 0, llen)];
+        let lr_fb = build_link_redirect_fallback(&files, &jobs, 4, &overflow);
 
         // Verify parity across all linked keys + unlinked probes between MT slotted, ST slotted, resolve(), and fallback
         for i in 0..500usize {
