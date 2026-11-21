@@ -116,6 +116,16 @@ impl<T> HugeZeroed<T> {
             unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) }
         }
     }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
+    }
 }
 
 impl<T> Deref for HugeZeroed<T> {

@@ -10,7 +10,7 @@ A zero-copy, SIMD-accelerated, sharded parallel Rust implementation with a nativ
 - `memmap2` (0.9) — Memory-mapped read-only CSV input
 - `mimalloc` (0.1) — Contention-free multi-threaded allocator
 
-Using custom lock-free `std::thread` parallelism, AVX-512/AVX2 + `pclmulqdq` fused `CsvRowSink` CSV scanning, `HugeZeroed`/`HugeSlab` transparent-huge-page (`MADV_HUGEPAGE`) memory, non-temporal (`_mm256_stream_si256`) `NtSlabBuckets`, a 2-pass lock-free DSU for link resolution, a 64-entry L1-resident `FastDateCache` + overlapping `u64` SWAR parsers, pre-faulted zero-contention Stage 4 with Condvar-gated `munmap`, and a native zero-copy `write_vectored` Parquet v1 (`UNCOMPRESSED` + `PLAIN`) writer.
+Using custom lock-free `std::thread` parallelism, carry-bit AVX-512/AVX2 + `pclmulqdq` fused `CsvRowSink` CSV scanning, SSSE3/SSE4.1 pair-parallel Base-37 + BMI2 `Pack64` key encoding, `HugeZeroed`/`HugeSlab` transparent-huge-page (`MADV_HUGEPAGE`) memory, non-temporal (`_mm256_stream_si256`) `NtSlabBuckets` and fused-pointer `DirectSlabBuckets`, a 2-pass lock-free DSU + Bloom-filtered flat `LinkRedirect`, a 64-entry L1-resident `FastDateCache` + SWAR/SIMD parsers, cache-resident sorting-network + LSD radix Stage 4 sessionization with overlapped background cleanup, and a native zero-copy `write_vectored` Parquet v1 (`UNCOMPRESSED` + `RLE_DICTIONARY`/`PLAIN`) writer.
 
 ## Build & Run
 

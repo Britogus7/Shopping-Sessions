@@ -180,9 +180,10 @@ unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
         let mut pos = 0usize;
         let mut prev_ended_delim = 1u64;
         let mut prev_in_q = 0u64;
+        let mut prev_close63 = 0u64;
         let mut bad = 0u64;
         let mut n_delims = 0usize;
-        let mut expected_nl = N - 1;
+        let mut n_nl = 0usize;
 
         while pos < blen {
             let rem = blen - pos;
@@ -194,16 +195,15 @@ unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
             };
 
             let delim = nl_m | cm_m;
-            let next_is_delim: u64 = if pos + step < blen {
-                let nb = *ptr.add(pos + step);
-                u64::from(nb == b',' || nb == b'\n')
-            } else {
-                1
-            };
             let open = (delim << 1) | prev_ended_delim;
-            let close = (delim >> 1) | (if step == 64 { next_is_delim << 63 } else { 0 });
             let in_q = prefix_xor(qt_m) ^ prev_in_q;
-            bad |= (qt_m & !(open | close)) | (qt_m & open & close) | (in_q & delim);
+            let opening = qt_m & in_q;
+            let closing = qt_m & !in_q;
+            bad |= (prev_close63 & !delim)
+                | (opening & !open)
+                | (closing & !(delim >> 1) & 0x7FFF_FFFF_FFFF_FFFF)
+                | (in_q & delim);
+            prev_close63 = closing >> 63;
             prev_ended_delim = delim >> 63;
             prev_in_q = 0u64.wrapping_sub(in_q >> 63);
 
@@ -224,19 +224,23 @@ unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
                 dst = dst.add(4);
             }
             n_delims = old_n + cnt;
-
-            let mut nm = nl_m;
-            while nm != 0 {
-                let b = nm.trailing_zeros();
-                let nl_idx = old_n + (delim & ((1u64 << b) - 1)).count_ones() as usize;
-                bad |= (nl_idx ^ expected_nl) as u64;
-                expected_nl += N;
-                nm &= nm - 1;
-            }
+            n_nl += nl_m.count_ones() as usize;
             pos += step;
         }
 
-        if bad != 0 || prev_in_q != 0 || n_delims != expected_nl + 1 - N {
+        if (bad | prev_close63 | prev_in_q) == 0 && n_nl * N == n_delims {
+            let mut k = N - 1;
+            let pbase = pos_buf.as_ptr();
+            while k < n_delims {
+                if *ptr.add(*pbase.add(k) as usize) != b'\n' {
+                    bad = 1;
+                    break;
+                }
+                k += N;
+            }
+        }
+
+        if (bad | prev_close63 | prev_in_q) != 0 || n_nl * N != n_delims {
             for_each_data_line(blk, false, |line| {
                 if let Some(row) = parse_csv_line::<N>(line) {
                     sink.on_row(&row);
@@ -646,17 +650,22 @@ fn parse_iso_datetime_cold_rel_sec(b: &[u8], win_start_sec: i64) -> Option<i64> 
 #[inline(always)]
 fn parse_hms_swar(w_hms: u64) -> Option<i64> {
     let d = w_hms.wrapping_sub(0x3030_3A30_303A_3030);
-    if ((d & 0x0000_FF00_00FF_0000)
-        | ((d.wrapping_add(0x7676_0076_7600_7676) | d) & 0x8080_0080_8000_8080))
-        != 0
-    {
-        return None;
-    }
     let pairs = (d & 0x00FF_0000_FF00_00FF) * 10 + ((d >> 8) & 0x00FF_0000_FF00_00FF);
-    if (pairs.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080) != 0 {
+    let bad1 = (d & 0x0000_FF00_00FF_0000)
+        | ((d.wrapping_add(0x7676_0076_7600_7676) | d) & 0x8080_0080_8000_8080);
+    let bad2 = pairs.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080;
+    if (bad1 | bad2) != 0 {
         return None;
     }
     Some(((pairs & 0xFF) * 3_600 + ((pairs >> 24) & 0xFF) * 60 + (pairs >> 48)) as i64)
+}
+
+/// Unchecked `HH:MM:SS` SWAR parser used strictly for `ingest_ts`, which `rules.md` guarantees is valid F1.
+#[inline(always)]
+fn parse_hms_unchecked(w_hms: u64) -> i64 {
+    let d = w_hms.wrapping_sub(0x3030_3A30_303A_3030);
+    let pairs = (d & 0x00FF_0000_FF00_00FF) * 10 + ((d >> 8) & 0x00FF_0000_FF00_00FF);
+    ((pairs & 0xFF) * 3_600 + ((pairs >> 24) & 0xFF) * 60 + (pairs >> 48)) as i64
 }
 
 #[inline(always)]
@@ -754,12 +763,12 @@ fn resolve_iso_day_rel_sec(
 
 #[inline(always)]
 pub fn parse_ingest_fast_sec(b: &[u8], cache: &FastDateCache) -> Option<(i32, IngestHint)> {
-    if b.len() == 20 && b[19] == b'Z' && cache.win_start_whole_sec {
+    if b.len() == 20 && cache.win_start_whole_sec {
         let p = b.as_ptr();
         let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
         let ddt = unsafe { (p.add(8) as *const u32).read_unaligned() }.to_le() & 0x00FF_FFFF;
         let w_hms = unsafe { (p.add(11) as *const u64).read_unaligned() }.to_le();
-        let time_sec = parse_hms_swar(w_hms)?;
+        let time_sec = parse_hms_unchecked(w_hms);
         if let Some((day_rel_sec, ym, c_ddt)) = resolve_iso_day_rel_sec(w0, ddt, cache) {
             return Some((
                 (day_rel_sec + time_sec) as i32,
@@ -807,6 +816,7 @@ pub fn parse_ingest_rel_sec(b: &[u8], cache: &FastDateCache) -> Option<(i64, boo
     parse_ingest_with_hint(b, cache).map(|(v, r, _)| (v, r))
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
 #[inline(always)]
 fn swar8_from_digits(mut x: u64) -> u64 {
     x = (x * 10 + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
@@ -827,9 +837,27 @@ fn parse_f3_13(b: &[u8], cache: &FastDateCache) -> Option<i64> {
     if bad != 0 {
         return None;
     }
-    let hi5 = swar8_from_digits(d0 << 24);
-    let lo8 = swar8_from_digits(d1);
-    let ms = (hi5 * 100_000_000 + lo8) as i64;
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    let ms = {
+        use std::arch::x86_64::*;
+        unsafe {
+            let x = _mm_set_epi64x(d1 as i64, (d0 << 24) as i64);
+            let p = _mm_maddubs_epi16(x, _mm_set1_epi16((1i16 << 8) | 10));
+            let q = _mm_madd_epi16(p, _mm_set1_epi32((1i32 << 16) | 100));
+            let r = _mm_madd_epi16(
+                _mm_packs_epi32(q, q),
+                _mm_set1_epi32((1i32 << 16) | 10_000),
+            );
+            let both = _mm_cvtsi128_si64(r) as u64;
+            ((both & 0xFFFF_FFFF) * 100_000_000 + (both >> 32)) as i64
+        }
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    let ms = {
+        let hi5 = swar8_from_digits(d0 << 24);
+        let lo8 = swar8_from_digits(d1);
+        (hi5 * 100_000_000 + lo8) as i64
+    };
     Some(ms - cache.win_start_ms)
 }
 
@@ -841,31 +869,29 @@ pub fn parse_ts_rel_ms_with_hint(
     hint: &IngestHint,
 ) -> Option<i64> {
     let len = b.len();
+    if len == 20 && b[19] == b'Z' {
+        if cache.win_start_whole_sec {
+            return parse_iso_body_rel_sec_with_hint(b, cache, hint).map(|s| s * 1_000);
+        }
+        return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
+    }
     if len == 13 {
         return parse_f3_13(b, cache);
     }
-    if len >= 20 {
-        if len == 20 && b[19] == b'Z' {
-            if cache.win_start_whole_sec {
-                return parse_iso_body_rel_sec_with_hint(b, cache, hint).map(|s| s * 1_000);
-            }
-            return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
+    if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+        let oh = d2(b[20], b[21])?;
+        let om = d2(b[23], b[24])?;
+        if oh > 23 || om > 59 {
+            return None;
         }
-        if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-            let oh = d2(b[20], b[21])?;
-            let om = d2(b[23], b[24])?;
-            if oh > 23 || om > 59 {
-                return None;
-            }
-            let off_sec = oh * 3_600 + om * 60;
-            let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
-            if cache.win_start_whole_sec {
-                let utc_sec = parse_iso_body_rel_sec_with_hint(b, cache, hint)?;
-                return Some(utc_sec * 1_000 + off_ms);
-            }
-            let utc_ms = parse_iso_datetime(b)?;
-            return Some(utc_ms + off_ms - cache.win_start_ms);
+        let off_sec = oh * 3_600 + om * 60;
+        let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
+        if cache.win_start_whole_sec {
+            let utc_sec = parse_iso_body_rel_sec_with_hint(b, cache, hint)?;
+            return Some(utc_sec * 1_000 + off_ms);
         }
+        let utc_ms = parse_iso_datetime(b)?;
+        return Some(utc_ms + off_ms - cache.win_start_ms);
     }
     parse_ts_f3_general(b).map(|ms| ms - cache.win_start_ms)
 }
@@ -874,31 +900,29 @@ pub fn parse_ts_rel_ms_with_hint(
 #[inline(always)]
 pub fn parse_ts_rel_ms(b: &[u8], cache: &FastDateCache) -> Option<i64> {
     let len = b.len();
+    if len == 20 && b[19] == b'Z' {
+        if cache.win_start_whole_sec {
+            return parse_iso_body_rel_sec(b, cache).map(|s| s * 1_000);
+        }
+        return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
+    }
     if len == 13 {
         return parse_f3_13(b, cache);
     }
-    if len >= 20 {
-        if len == 20 && b[19] == b'Z' {
-            if cache.win_start_whole_sec {
-                return parse_iso_body_rel_sec(b, cache).map(|s| s * 1_000);
-            }
-            return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
+    if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+        let oh = d2(b[20], b[21])?;
+        let om = d2(b[23], b[24])?;
+        if oh > 23 || om > 59 {
+            return None;
         }
-        if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-            let oh = d2(b[20], b[21])?;
-            let om = d2(b[23], b[24])?;
-            if oh > 23 || om > 59 {
-                return None;
-            }
-            let off_sec = oh * 3_600 + om * 60;
-            let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
-            if cache.win_start_whole_sec {
-                let utc_sec = parse_iso_body_rel_sec(b, cache)?;
-                return Some(utc_sec * 1_000 + off_ms);
-            }
-            let utc_ms = parse_iso_datetime(b)?;
-            return Some(utc_ms + off_ms - cache.win_start_ms);
+        let off_sec = oh * 3_600 + om * 60;
+        let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
+        if cache.win_start_whole_sec {
+            let utc_sec = parse_iso_body_rel_sec(b, cache)?;
+            return Some(utc_sec * 1_000 + off_ms);
         }
+        let utc_ms = parse_iso_datetime(b)?;
+        return Some(utc_ms + off_ms - cache.win_start_ms);
     }
     parse_ts_f3_general(b).map(|ms| ms - cache.win_start_ms)
 }

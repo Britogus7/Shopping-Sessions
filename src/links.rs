@@ -1,5 +1,5 @@
-//! Direct 2-pass lock-free DSU link resolver (with 3-bit register-blocked Bloom filter)
-//! and cold bucketed fallback for adversarially dense short-ID inputs.
+//! Direct 2-pass lock-free DSU link resolver (with 3-bit register-blocked Bloom filter
+//! and flat open-addressed redirect table) and cold bucketed fallback.
 
 use std::cmp::Ordering;
 use std::fs::File;
@@ -8,9 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering 
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::csv::scan_csv_mmap_chunk;
+use crate::csv::{scan_csv_mmap_chunk, scan_csv_mmap_chunk_sink, CsvRowSink};
 use crate::huge::HugeZeroed;
-use crate::pack::{mix64, OverflowInterner, EMPTY_KEY};
+use crate::pack::{
+    decode_canon_val, encode_canon_val, link_hash, mix64, pack_b37_pair, OverflowInterner,
+    B37_LIMIT, EMPTY_KEY,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -44,9 +47,9 @@ pub struct LinkRedirect {
 #[inline(always)]
 fn bloom_word_and_mask(h: u64, wmask: usize) -> (usize, u64) {
     let w = (h as usize) & wmask;
-    let m = (1u64 << ((h >> 46) & 63))
-        | (1u64 << ((h >> 52) & 63))
-        | (1u64 << ((h >> 58) & 63));
+    let m = (1u64 << ((h >> 24) & 63))
+        | (1u64 << ((h >> 30) & 63))
+        | (1u64 << ((h >> 36) & 63));
     (w, m)
 }
 
@@ -80,7 +83,7 @@ impl LinkRedirect {
 
     #[inline(always)]
     pub fn prefetch_bloom_for(&self, k: u64) -> u64 {
-        let h = mix64(k);
+        let h = link_hash(k);
         if !self.bitset.is_empty() {
             let w = (h as usize) & self.wmask;
             prefetch_addr(unsafe { self.bitset.as_ptr().add(w) });
@@ -90,7 +93,7 @@ impl LinkRedirect {
 
     #[inline(always)]
     pub fn bloom_hit_slot_with_hash(&self, h: u64) -> Option<usize> {
-        if self.slots.is_empty() {
+        if self.is_empty() {
             return None;
         }
         let (w, m) = bloom_word_and_mask(h, self.wmask);
@@ -98,19 +101,7 @@ impl LinkRedirect {
         if (word & m) != m {
             return None;
         }
-        Some(((h >> 20) as usize) & self.smask)
-    }
-
-    #[inline(always)]
-    pub fn bloom_hit_slot_hash(&self, k: u64) -> (u64, Option<usize>) {
-        let h = mix64(k);
-        (h, self.bloom_hit_slot_with_hash(h))
-    }
-
-    #[allow(dead_code)]
-    #[inline(always)]
-    pub fn bloom_hit_slot(&self, k: u64) -> Option<usize> {
-        self.bloom_hit_slot_hash(k).1
+        Some(((h >> 16) as usize) & self.smask)
     }
 
     #[inline(always)]
@@ -118,15 +109,17 @@ impl LinkRedirect {
         prefetch_addr(unsafe { self.slots.as_ptr().add(idx) });
     }
 
+    /// Resolve a user key `k` whose `link_hash(k) == h` using pre-computed slot `idx`.
+    /// Returns `mix42(person)` when `person < B37_LIMIT`, or raw `person` otherwise.
     #[inline(always)]
-    pub fn resolve_from_slot(&self, k: u64, mut idx: usize) -> u64 {
+    pub fn resolve_from_slot_hashed(&self, k: u64, h: u64, mut idx: usize) -> u64 {
         loop {
-            let slot = unsafe { *self.slots.get_unchecked(idx) };
-            if slot.key == k {
-                return slot.val;
+            let s = unsafe { *self.slots.get_unchecked(idx) };
+            if s.key == k {
+                return s.val;
             }
-            if slot.key == EMPTY_KEY {
-                return k;
+            if s.key == EMPTY_KEY {
+                return if k < B37_LIMIT { h } else { k };
             }
             idx = (idx + 1) & self.smask;
         }
@@ -135,10 +128,14 @@ impl LinkRedirect {
     #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     pub fn resolve(&self, k: u64) -> u64 {
-        let Some(idx) = self.bloom_hit_slot(k) else {
+        if self.is_empty() {
+            return k;
+        }
+        let h = link_hash(k);
+        let Some(idx) = self.bloom_hit_slot_with_hash(h) else {
             return k;
         };
-        self.resolve_from_slot(k, idx)
+        decode_canon_val(self.resolve_from_slot_hashed(k, h, idx))
     }
 }
 
@@ -239,7 +236,7 @@ fn union_min_zero(
         }
         let ku = unsafe { keys.get_unchecked(u as usize) }.load(MemOrdering::Acquire);
         let kv = unsafe { keys.get_unchecked(v as usize) }.load(MemOrdering::Acquire);
-        if overflow.cmp_key(kv, ku) == Ordering::Less {
+        if overflow.cmp_user_key(kv, ku) == Ordering::Less {
             std::mem::swap(&mut u, &mut v);
         }
         if unsafe { parent.get_unchecked(v as usize) }
@@ -251,7 +248,7 @@ fn union_min_zero(
     }
 }
 
-fn finalize_redirect_from_pairs<F>(num_redirects: usize, fill: F) -> LinkRedirect
+fn finalize_redirect_table<F>(num_redirects: usize, fill: F) -> LinkRedirect
 where
     F: FnOnce(&[AtomicRedirectSlot], &[AtomicU64], usize, usize),
 {
@@ -263,7 +260,7 @@ where
         .next_power_of_two()
         .max(64);
     let smask = slots_cap - 1;
-    let atomic_slots: HugeZeroed<AtomicRedirectSlot> = HugeZeroed::new(slots_cap);
+    let atomic_sec: HugeZeroed<AtomicRedirectSlot> = HugeZeroed::new(slots_cap);
 
     let num_words = (num_redirects / 4)
         .next_power_of_two()
@@ -271,12 +268,12 @@ where
     let wmask = num_words - 1;
     let atomic_bitset: HugeZeroed<AtomicU64> = HugeZeroed::new(num_words);
 
-    fill(&atomic_slots, &atomic_bitset, smask, wmask);
+    fill(&atomic_sec, &atomic_bitset, smask, wmask);
 
     LinkRedirect {
         bitset: atomic_bitset.reinterpret::<u64>(),
         wmask,
-        slots: atomic_slots.reinterpret::<RedirectSlot>(),
+        slots: atomic_sec.reinterpret::<RedirectSlot>(),
         smask,
     }
 }
@@ -288,13 +285,13 @@ fn insert_redirect_slot_with_hash(
     smask: usize,
     wmask: usize,
     key: u64,
-    canon: u64,
+    encoded_val: u64,
     h: u64,
 ) {
     let (w, m) = bloom_word_and_mask(h, wmask);
     unsafe { abs.get_unchecked(w) }.fetch_or(m, MemOrdering::Relaxed);
 
-    let mut idx = ((h >> 20) as usize) & smask;
+    let mut idx = ((h >> 16) as usize) & smask;
     loop {
         let s_ref = unsafe { asl.get_unchecked(idx) };
         if s_ref
@@ -302,7 +299,7 @@ fn insert_redirect_slot_with_hash(
             .compare_exchange(EMPTY_KEY, key, MemOrdering::Relaxed, MemOrdering::Relaxed)
             .is_ok()
         {
-            s_ref.val.store(canon, MemOrdering::Relaxed);
+            s_ref.val.store(encoded_val, MemOrdering::Relaxed);
             break;
         }
         idx = (idx + 1) & smask;
@@ -318,7 +315,15 @@ fn insert_redirect_slot(
     key: u64,
     canon: u64,
 ) {
-    insert_redirect_slot_with_hash(asl, abs, smask, wmask, key, canon, mix64(key));
+    insert_redirect_slot_with_hash(
+        asl,
+        abs,
+        smask,
+        wmask,
+        key,
+        encode_canon_val(canon),
+        link_hash(key),
+    );
 }
 
 #[inline]
@@ -364,6 +369,100 @@ fn flush_edge_batch(
             return;
         };
         union_min_zero(parent_ref, keys_ref, overflow, ia, ib);
+    }
+}
+
+struct LinkSink<'a> {
+    keys_ref: &'a [AtomicU64],
+    parent_ref: &'a [AtomicU32],
+    mask: usize,
+    overflow: &'a OverflowInterner,
+    local_added: usize,
+    local_edges: bool,
+    global_nodes_ref: &'a AtomicUsize,
+    max_nodes: usize,
+    overflowed_ref: &'a AtomicBool,
+    edge_batch: [(u64, u64); 32],
+    batch_len: usize,
+}
+
+impl<'a> LinkSink<'a> {
+    #[inline(always)]
+    fn push_pair(&mut self, a: &[u8], b: &[u8]) {
+        let (ka, kb) = pack_b37_pair(a, b'u', b, b'u')
+            .unwrap_or_else(|| (self.overflow.encode_user(a), self.overflow.encode_user(b)));
+        if ka != kb {
+            self.local_edges = true;
+            self.edge_batch[self.batch_len] = (ka, kb);
+            self.batch_len += 1;
+            if self.batch_len == 32 {
+                flush_edge_batch(
+                    &self.edge_batch,
+                    self.keys_ref,
+                    self.parent_ref,
+                    self.mask,
+                    self.overflow,
+                    &mut self.local_added,
+                    self.global_nodes_ref,
+                    self.max_nodes,
+                    self.overflowed_ref,
+                );
+                self.batch_len = 0;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn flush_tail(&mut self) {
+        if self.batch_len > 0 && !self.overflowed_ref.load(MemOrdering::Relaxed) {
+            flush_edge_batch(
+                &self.edge_batch[..self.batch_len],
+                self.keys_ref,
+                self.parent_ref,
+                self.mask,
+                self.overflow,
+                &mut self.local_added,
+                self.global_nodes_ref,
+                self.max_nodes,
+                self.overflowed_ref,
+            );
+        }
+        self.batch_len = 0;
+    }
+}
+
+impl CsvRowSink<2> for LinkSink<'_> {
+    #[inline(always)]
+    unsafe fn on_pos(&mut self, ptr: *const u8, s0: usize, rpos: *const u16) {
+        if self.overflowed_ref.load(MemOrdering::Relaxed) {
+            return;
+        }
+        let e0 = *rpos as usize;
+        let q0 = usize::from(*ptr.add(s0) == b'"');
+        let a_len = (e0 - s0) - (q0 << 1);
+        if a_len == 0 {
+            return;
+        }
+        let e1 = *rpos.add(1) as usize;
+        let s1 = e0 + 1;
+        let q1 = usize::from(*ptr.add(s1) == b'"');
+        let b_len = (e1 - s1) - (q1 << 1);
+        if b_len == 0 {
+            return;
+        }
+        let a = std::slice::from_raw_parts(ptr.add(s0 + q0), a_len);
+        let b = std::slice::from_raw_parts(ptr.add(s1 + q1), b_len);
+        self.push_pair(a, b);
+    }
+
+    #[inline(always)]
+    fn on_row(&mut self, &[a, b]: &[&[u8]; 2]) {
+        if self.overflowed_ref.load(MemOrdering::Relaxed) {
+            return;
+        }
+        if !a.is_empty() && !b.is_empty() {
+            self.push_pair(a, b);
+        }
     }
 }
 
@@ -434,10 +533,19 @@ pub fn build_link_redirect(
 
         for _ in 0..read_nt {
             handles.push(s.spawn(move || {
-                let mut local_added = 0usize;
-                let mut local_edges = false;
-                let mut edge_batch = [(0u64, 0u64); 32];
-                let mut batch_len = 0usize;
+                let mut sink = LinkSink {
+                    keys_ref,
+                    parent_ref,
+                    mask,
+                    overflow,
+                    local_added: 0,
+                    local_edges: false,
+                    global_nodes_ref,
+                    max_nodes,
+                    overflowed_ref,
+                    edge_batch: [(0u64, 0u64); 32],
+                    batch_len: 0,
+                };
                 loop {
                     if overflowed_ref.load(MemOrdering::Relaxed) {
                         break;
@@ -446,50 +554,10 @@ pub fn build_link_redirect(
                     let Some(&(fidx, start, end)) = jobs_ref.get(jid) else {
                         break;
                     };
-                    scan_csv_mmap_chunk::<2, _>(&mmaps_ref[fidx], start, end, |&[a, b]| {
-                        if overflowed_ref.load(MemOrdering::Relaxed) {
-                            return;
-                        }
-                        if !a.is_empty() && !b.is_empty() {
-                            let ka = overflow.encode(a);
-                            let kb = overflow.encode(b);
-                            if ka != kb {
-                                local_edges = true;
-                                edge_batch[batch_len] = (ka, kb);
-                                batch_len += 1;
-                                if batch_len == 32 {
-                                    flush_edge_batch(
-                                        &edge_batch,
-                                        keys_ref,
-                                        parent_ref,
-                                        mask,
-                                        overflow,
-                                        &mut local_added,
-                                        global_nodes_ref,
-                                        max_nodes,
-                                        overflowed_ref,
-                                    );
-                                    batch_len = 0;
-                                }
-                            }
-                        }
-                    });
-                    if batch_len > 0 && !overflowed_ref.load(MemOrdering::Relaxed) {
-                        flush_edge_batch(
-                            &edge_batch[..batch_len],
-                            keys_ref,
-                            parent_ref,
-                            mask,
-                            overflow,
-                            &mut local_added,
-                            global_nodes_ref,
-                            max_nodes,
-                            overflowed_ref,
-                        );
-                    }
-                    batch_len = 0;
+                    scan_csv_mmap_chunk_sink::<2, _>(&mmaps_ref[fidx], start, end, &mut sink);
+                    sink.flush_tail();
                 }
-                if local_edges {
+                if sink.local_edges {
                     has_edges_ref.store(true, MemOrdering::Relaxed);
                 }
             }));
@@ -556,8 +624,8 @@ pub fn build_link_redirect(
     });
 
     let num_redirects = redirect_count.into_inner();
-    let res = finalize_redirect_from_pairs(num_redirects, |asl, abs, smask, wmask| {
-        // Pass 2b: Batched-prefetch scatter (key -> canonical_min_key) into LinkRedirect in parallel
+    let res = finalize_redirect_table(num_redirects, |asl, abs, smask, wmask| {
+        // Pass 2b: Batched-prefetch scatter (key -> encoded_canon) into flat redirect table
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(nt);
             for t in 0..nt {
@@ -575,12 +643,12 @@ pub fn build_link_redirect(
                         let p_raw = unsafe { p_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
                         if p_raw != 0 {
                             let key = unsafe { k_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
-                            let h = mix64(key);
+                            let h = link_hash(key);
                             let root_idx = (p_raw - 1) as usize;
                             prefetch_addr(unsafe { k_ref.as_ptr().add(root_idx) });
                             prefetch_addr(unsafe { abs.as_ptr().add((h as usize) & wmask) });
                             prefetch_addr(unsafe {
-                                asl.as_ptr().add(((h >> 20) as usize) & smask)
+                                asl.as_ptr().add(((h >> 16) as usize) & smask)
                             });
                             batch[blen] = (key, root_idx, h);
                             blen += 1;
@@ -589,7 +657,13 @@ pub fn build_link_redirect(
                                     let canon = unsafe { k_ref.get_unchecked(ridx) }
                                         .load(MemOrdering::Relaxed);
                                     insert_redirect_slot_with_hash(
-                                        asl, abs, smask, wmask, k, canon, kh,
+                                        asl,
+                                        abs,
+                                        smask,
+                                        wmask,
+                                        k,
+                                        encode_canon_val(canon),
+                                        kh,
                                     );
                                 }
                                 blen = 0;
@@ -598,9 +672,17 @@ pub fn build_link_redirect(
                     }
                     if blen > 0 {
                         for &(k, ridx, kh) in &batch[..blen] {
-                            let canon =
-                                unsafe { k_ref.get_unchecked(ridx) }.load(MemOrdering::Relaxed);
-                            insert_redirect_slot_with_hash(asl, abs, smask, wmask, k, canon, kh);
+                            let canon = unsafe { k_ref.get_unchecked(ridx) }
+                                .load(MemOrdering::Relaxed);
+                            insert_redirect_slot_with_hash(
+                                asl,
+                                abs,
+                                smask,
+                                wmask,
+                                k,
+                                encode_canon_val(canon),
+                                kh,
+                            );
                         }
                     }
                 }));
@@ -682,7 +764,7 @@ fn union_min_dense(
         if u == v {
             return;
         }
-        if overflow.cmp_key(keys[v as usize], keys[u as usize]) == Ordering::Less {
+        if overflow.cmp_user_key(keys[v as usize], keys[u as usize]) == Ordering::Less {
             std::mem::swap(&mut u, &mut v);
         }
         if parent[v as usize]
@@ -729,8 +811,8 @@ fn build_link_redirect_fallback(
                     };
                     scan_csv_mmap_chunk::<2, _>(&mmaps[fidx], start, end, |&[a, b]| {
                         if !a.is_empty() && !b.is_empty() {
-                            let ka = overflow.encode(a);
-                            let kb = overflow.encode(b);
+                            let ka = overflow.encode_user(a);
+                            let kb = overflow.encode_user(b);
                             if ka != kb {
                                 edges.push((ka, kb));
                                 key_buckets[(mix64(ka) as usize) & 63].push(ka);
@@ -925,7 +1007,7 @@ fn build_link_redirect_fallback(
     drop(parent);
 
     let num_redirects = redirect_count.into_inner();
-    finalize_redirect_from_pairs(num_redirects, |asl, abs, smask, wmask| {
+    finalize_redirect_table(num_redirects, |asl, abs, smask, wmask| {
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             let mut offset = 0usize;
@@ -1006,23 +1088,23 @@ mod tests {
         let lr_fb = build_link_redirect_fallback(&mmaps, &jobs, 4, &overflow);
 
         for checker in [&lr, &lr_fb] {
-            let canon_c = overflow.encode(b"c000");
+            let canon_c = overflow.encode_user(b"c000");
             for i in 0..400 {
-                let k = overflow.encode(format!("c{i:03}").as_bytes());
+                let k = overflow.encode_user(format!("c{i:03}").as_bytes());
                 assert_eq!(checker.resolve(k), canon_c, "chain idx {i}");
             }
-            let solo = overflow.encode(b"solo");
+            let solo = overflow.encode_user(b"solo");
             assert_eq!(checker.resolve(solo), solo);
-            let u1 = overflow.encode(b"u1");
+            let u1 = overflow.encode_user(b"u1");
             assert_eq!(checker.resolve(u1), u1);
             assert_eq!(
-                checker.resolve(overflow.encode(b"a2")),
-                overflow.encode(b"a1")
+                checker.resolve(overflow.encode_user(b"a2")),
+                overflow.encode_user(b"a1")
             );
-            let hub = overflow.encode(b"0_hub");
-            assert_eq!(checker.resolve(overflow.encode(b"kiosk_shared")), hub);
+            let hub = overflow.encode_user(b"0_hub");
+            assert_eq!(checker.resolve(overflow.encode_user(b"kiosk_shared")), hub);
             for i in 0..200 {
-                let mk = overflow.encode(format!("very_long_kiosk_member_{i:04}").as_bytes());
+                let mk = overflow.encode_user(format!("very_long_kiosk_member_{i:04}").as_bytes());
                 assert_eq!(checker.resolve(mk), hub, "kiosk member {i}");
             }
         }
@@ -1031,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn link_redirect_dense_triggers_fallback_cleanly() {
+    fn link_redirect_dense_mixed_keys_and_slotted_parity() {
         let dir = std::env::temp_dir().join("shopping_links_dense_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1039,24 +1121,52 @@ mod tests {
         {
             let mut w = File::create(&f).unwrap();
             writeln!(w, "user_id_a,user_id_b").unwrap();
-            // 3200 unique nodes inside ~25 KB => forces overflowed fallback on cap=4096 (max_nodes=3072)
             for i in 0..1600usize {
-                writeln!(w, "x{i},y{i}").unwrap();
+                writeln!(w, "u{i},x{i}").unwrap();
             }
-            writeln!(w, "x0,00_root").unwrap();
-            writeln!(w, "y0,x1").unwrap();
+            writeln!(w, "u0,U0").unwrap();
+            writeln!(w, "x0,u1").unwrap();
         }
         let overflow = OverflowInterner::new();
-        let lr = build_link_redirect(&[f], 4, &overflow);
-        let root = overflow.encode(b"00_root");
-        assert_eq!(lr.resolve(overflow.encode(b"x0")), root);
-        assert_eq!(lr.resolve(overflow.encode(b"y0")), root);
-        assert_eq!(lr.resolve(overflow.encode(b"x1")), root);
-        assert_eq!(lr.resolve(overflow.encode(b"y1")), root);
+        let checker = build_link_redirect(&[f], 4, &overflow);
+
+        let root = overflow.encode_user(b"U0");
+        assert_eq!(checker.resolve(overflow.encode_user(b"u0")), root);
+        assert_eq!(checker.resolve(overflow.encode_user(b"x0")), root);
+        assert_eq!(checker.resolve(overflow.encode_user(b"u1")), root);
+        assert_eq!(checker.resolve(overflow.encode_user(b"x1")), root);
         assert_eq!(
-            lr.resolve(overflow.encode(b"y1599")),
-            overflow.encode(b"x1599")
+            checker.resolve(overflow.encode_user(b"x1599")),
+            overflow.encode_user(b"u1599")
         );
+        let unlinked = overflow.encode_user(b"u99999999");
+        assert_eq!(checker.resolve(unlinked), unlinked);
+
+        // Verify resolve_from_slot_hashed matches resolve across linked and unlinked keys
+        for s in [
+            b"u0".as_slice(),
+            b"x0",
+            b"x1599",
+            b"u1599",
+            b"u99999999",
+            b"unlinked_very_long_key_12345",
+        ] {
+            let k = overflow.encode_user(s);
+            let h = checker.prefetch_bloom_for(k);
+            let slotted = match checker.bloom_hit_slot_with_hash(h) {
+                Some(idx) => decode_canon_val(checker.resolve_from_slot_hashed(k, h, idx)),
+                None => k,
+            };
+            assert_eq!(slotted, checker.resolve(k), "slot parity failed for {s:?}");
+        }
+
+        // Empty LinkRedirect safety
+        let empty = LinkRedirect::empty();
+        let k0 = overflow.encode_user(b"u1234567");
+        assert!(empty.is_empty());
+        assert_eq!(empty.bloom_hit_slot_with_hash(empty.prefetch_bloom_for(k0)), None);
+        assert_eq!(empty.resolve(k0), k0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
