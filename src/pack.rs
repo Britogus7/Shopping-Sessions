@@ -209,6 +209,108 @@ pub fn pack_b37_pair(sa: &[u8], pa: u8, sb: &[u8], pb: u8) -> Option<(u64, u64)>
     Some((pack_b37(sa, pa)?, pack_b37(sb, pb)?))
 }
 
+/// Ultra-fast pair-parallel Base-37 encoding when caller already validated prefix and length in {8, 9} (`is9` in {0, 1}).
+///
+/// # Safety
+/// `pa` and `pb` must each point to at least `8 + is9` readable bytes with `is9 in 0..=1` and valid prefix byte.
+#[inline(always)]
+pub unsafe fn pack_b37_pair_89(
+    pa: *const u8,
+    is9_a: usize,
+    pb: *const u8,
+    is9_b: usize,
+) -> Option<(u64, u64)> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    {
+        let wa = u64::from_le_bytes(*(pa.add(is9_a) as *const [u8; 8])) >> ((1 - is9_a) << 3);
+        let wb = u64::from_le_bytes(*(pb.add(is9_b) as *const [u8; 8])) >> ((1 - is9_b) << 3);
+        use std::arch::x86_64::*;
+        let v = _mm_set_epi64x(wb as i64, wa as i64);
+        let m_dig = _mm_cmpgt_epi8(_mm_set1_epi8(-118), _mm_sub_epi8(v, _mm_set1_epi8(-80)));
+        let m_low = _mm_cmpgt_epi8(_mm_set1_epi8(-102), _mm_sub_epi8(v, _mm_set1_epi8(-31)));
+        let valid = _mm_or_si128(m_dig, m_low);
+        let need = (0x7Fu32 | ((is9_a as u32) << 7)) | ((0x7Fu32 | ((is9_b as u32) << 7)) << 8);
+        if (_mm_movemask_epi8(valid) as u32) != need {
+            return None;
+        }
+        let sub = _mm_add_epi8(_mm_set1_epi8(0x2F), _mm_and_si128(m_low, _mm_set1_epi8(39)));
+        let digits = _mm_and_si128(_mm_sub_epi8(v, sub), valid);
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16((1i16 << 8) | 37));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32((1i32 << 16) | 1369));
+        let qa = _mm_cvtsi128_si64(quads) as u64;
+        let qb = _mm_extract_epi64::<1>(quads) as u64;
+        Some((
+            (qa & 0xFFFF_FFFF) * 1_874_161 + (qa >> 32),
+            (qb & 0xFFFF_FFFF) * 1_874_161 + (qb >> 32),
+        ))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    {
+        let sa = std::slice::from_raw_parts(pa, 8 + is9_a);
+        let sb = std::slice::from_raw_parts(pb, 8 + is9_b);
+        Some((pack_b37(sa, *pa)?, pack_b37(sb, *pb)?))
+    }
+}
+
+/// Quad-parallel 256-bit AVX2 Base-37 encoding for two interleaved 8/9-byte `(eid, uid)` pairs.
+///
+/// # Safety
+/// Each pointer must point to at least `8 + is9` readable bytes with `is9 in 0..=1` and valid prefix byte.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub unsafe fn pack_b37_quad_89(
+    pa: *const u8,
+    ia: usize,
+    pb: *const u8,
+    ib: usize,
+    pc: *const u8,
+    ic: usize,
+    pd: *const u8,
+    id: usize,
+) -> Option<(u64, u64, u64, u64)> {
+    let wa = u64::from_le_bytes(*(pa.add(ia) as *const [u8; 8])) >> ((1 - ia) << 3);
+    let wb = u64::from_le_bytes(*(pb.add(ib) as *const [u8; 8])) >> ((1 - ib) << 3);
+    let wc = u64::from_le_bytes(*(pc.add(ic) as *const [u8; 8])) >> ((1 - ic) << 3);
+    let wd = u64::from_le_bytes(*(pd.add(id) as *const [u8; 8])) >> ((1 - id) << 3);
+    use std::arch::x86_64::*;
+    let v = _mm256_set_epi64x(wd as i64, wc as i64, wb as i64, wa as i64);
+    let m_dig = _mm256_cmpgt_epi8(
+        _mm256_set1_epi8(-118),
+        _mm256_sub_epi8(v, _mm256_set1_epi8(-80)),
+    );
+    let m_low = _mm256_cmpgt_epi8(
+        _mm256_set1_epi8(-102),
+        _mm256_sub_epi8(v, _mm256_set1_epi8(-31)),
+    );
+    let valid = _mm256_or_si256(m_dig, m_low);
+    let need = (0x7Fu32 | ((ia as u32) << 7))
+        | ((0x7Fu32 | ((ib as u32) << 7)) << 8)
+        | ((0x7Fu32 | ((ic as u32) << 7)) << 16)
+        | ((0x7Fu32 | ((id as u32) << 7)) << 24);
+    if (_mm256_movemask_epi8(valid) as u32) != need {
+        return None;
+    }
+    let sub = _mm256_add_epi8(
+        _mm256_set1_epi8(0x2F),
+        _mm256_and_si256(m_low, _mm256_set1_epi8(39)),
+    );
+    let digits = _mm256_and_si256(_mm256_sub_epi8(v, sub), valid);
+    let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16((1i16 << 8) | 37));
+    let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32((1i32 << 16) | 1369));
+    let lo = _mm256_castsi256_si128(quads);
+    let hi = _mm256_extracti128_si256::<1>(quads);
+    let qa = _mm_cvtsi128_si64(lo) as u64;
+    let qb = _mm_extract_epi64::<1>(lo) as u64;
+    let qc = _mm_cvtsi128_si64(hi) as u64;
+    let qd = _mm_extract_epi64::<1>(hi) as u64;
+    Some((
+        (qa & 0xFFFF_FFFF) * 1_874_161 + (qa >> 32),
+        (qb & 0xFFFF_FFFF) * 1_874_161 + (qb >> 32),
+        (qc & 0xFFFF_FFFF) * 1_874_161 + (qc >> 32),
+        (qd & 0xFFFF_FFFF) * 1_874_161 + (qd >> 32),
+    ))
+}
+
 /// Unified 64-bit hash for user/person keys (`mix42` for Base-37 keys, `mix64` otherwise).
 #[inline(always)]
 pub fn link_hash(k: u64) -> u64 {
@@ -888,6 +990,63 @@ mod tests {
                             _ => None,
                         };
                         assert_eq!(pack_b37_pair(tu, b'u', &e, b'e'), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pack_b37_pair_and_quad_89_matches_single() {
+        for tu in [b"u09az09a".as_slice(), b"u09az09az".as_slice()] {
+            for te in [b"e0z9a0z9".as_slice(), b"e0z9a0z9a".as_slice()] {
+                let ia = tu.len() - 8;
+                let ib = te.len() - 8;
+                let exp = (pack_b37(tu, b'u').unwrap(), pack_b37(te, b'e').unwrap());
+                assert_eq!(
+                    unsafe { pack_b37_pair_89(tu.as_ptr(), ia, te.as_ptr(), ib) },
+                    Some(exp)
+                );
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                assert_eq!(
+                    unsafe {
+                        pack_b37_quad_89(
+                            tu.as_ptr(),
+                            ia,
+                            te.as_ptr(),
+                            ib,
+                            tu.as_ptr(),
+                            ia,
+                            te.as_ptr(),
+                            ib,
+                        )
+                    },
+                    Some((exp.0, exp.1, exp.0, exp.1))
+                );
+                for pos in 1..tu.len() {
+                    for bad in [b'A', b'Z', b'_', b'{', b'/', 0u8, 0xFF] {
+                        let mut u = tu.to_vec();
+                        u[pos] = bad;
+                        assert_eq!(
+                            unsafe { pack_b37_pair_89(u.as_ptr(), ia, te.as_ptr(), ib) },
+                            None
+                        );
+                        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                        assert_eq!(
+                            unsafe {
+                                pack_b37_quad_89(
+                                    u.as_ptr(),
+                                    ia,
+                                    te.as_ptr(),
+                                    ib,
+                                    tu.as_ptr(),
+                                    ia,
+                                    te.as_ptr(),
+                                    ib,
+                                )
+                            },
+                            None
+                        );
                     }
                 }
             }

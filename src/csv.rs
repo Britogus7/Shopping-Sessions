@@ -550,17 +550,15 @@ struct DayCacheEntry {
 
 #[inline(always)]
 fn day_cache_slot(ym: u64, ddt: u32) -> usize {
-    let day_bucket = (((ddt & 3) * 10 + ((ddt >> 8) & 15)) & 31) as usize;
-    let m_parity = (((ym >> 48) & 1) << 5) as usize;
-    day_bucket | m_parity
+    ((((ddt & 3) << 4) | ((ddt >> 8) & 15)) as usize) | ((((ym >> 48) & 1) << 6) as usize)
 }
 
-/// Compact L1-resident 64-entry day cache (`1 KB`) for branchless ISO date resolution.
+/// Compact L1-resident 128-entry day cache (`2 KB`) for zero-multiply ISO date resolution.
 pub struct FastDateCache {
     pub win_start_ms: i64,
     pub win_start_sec: i64,
     pub win_start_whole_sec: bool,
-    entries: [DayCacheEntry; 64],
+    entries: [DayCacheEntry; 128],
 }
 
 impl FastDateCache {
@@ -574,10 +572,10 @@ impl FastDateCache {
             ym: 0,
             ddt: 0,
             rel_sec: 0,
-        }; 64];
+        }; 128];
         let mut filled = 0usize;
         let mut d = start_day;
-        while d <= end_day && filled < 60 {
+        while d <= end_day && filled < 120 {
             let (y, m, dom) = civil_from_days(d);
             if (0..=9999).contains(&y) {
                 let ym_str = format!("{y:04}-{m:02}-");
@@ -645,24 +643,31 @@ fn parse_iso_datetime_cold_rel_sec(b: &[u8], win_start_sec: i64) -> Option<i64> 
 }
 
 #[inline(always)]
-fn parse_hms_swar(w_hms: u64) -> Option<i64> {
+pub fn parse_d2(a: u8, b: u8) -> Option<i64> {
+    d2(a, b)
+}
+
+#[inline(always)]
+pub fn parse_hms_swar(w_hms: u64) -> Option<i64> {
     let d = w_hms.wrapping_sub(0x3030_3A30_303A_3030);
-    let pairs = (d & 0x00FF_0000_FF00_00FF) * 10 + ((d >> 8) & 0x00FF_0000_FF00_00FF);
     let bad1 = (d & 0x0000_FF00_00FF_0000)
         | ((d.wrapping_add(0x7676_0076_7600_7676) | d) & 0x8080_0080_8000_8080);
+    let pairs = (d.wrapping_mul(0x0A01) >> 8) & 0x00FF_0000_FF00_00FF;
     let bad2 = pairs.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080;
     if (bad1 | bad2) != 0 {
         return None;
     }
-    Some(((pairs & 0xFF) * 3_600 + ((pairs >> 24) & 0xFF) * 60 + (pairs >> 48)) as i64)
+    let lo = pairs & 0x0000_0000_FF00_00FF;
+    Some((((lo.wrapping_mul((3_600u64 << 24) | 60u64) >> 24) & 0x1FFFF) + (pairs >> 48)) as i64)
 }
 
 /// Unchecked `HH:MM:SS` SWAR parser used strictly for `ingest_ts`, which `rules.md` guarantees is valid F1.
 #[inline(always)]
 fn parse_hms_unchecked(w_hms: u64) -> i64 {
     let d = w_hms.wrapping_sub(0x3030_3A30_303A_3030);
-    let pairs = (d & 0x00FF_0000_FF00_00FF) * 10 + ((d >> 8) & 0x00FF_0000_FF00_00FF);
-    ((pairs & 0xFF) * 3_600 + ((pairs >> 24) & 0xFF) * 60 + (pairs >> 48)) as i64
+    let pairs = (d.wrapping_mul(0x0A01) >> 8) & 0x00FF_0000_FF00_00FF;
+    let lo = pairs & 0x0000_0000_FF00_00FF;
+    (((lo.wrapping_mul((3_600u64 << 24) | 60u64) >> 24) & 0x1FFFF) + (pairs >> 48)) as i64
 }
 
 #[inline(always)]
@@ -698,7 +703,7 @@ pub fn parse_8_digits_swar(chunk: [u8; 8]) -> Option<u64> {
 }
 
 #[inline(always)]
-fn resolve_iso_day_rel_sec(w0: u64, ddt: u32, cache: &FastDateCache) -> Option<i64> {
+pub fn resolve_iso_day_rel_sec(w0: u64, ddt: u32, cache: &FastDateCache) -> Option<i64> {
     let slot = day_cache_slot(w0, ddt);
     let entry = unsafe { *cache.entries.get_unchecked(slot) };
     if w0 == entry.ym && ddt == entry.ddt {
@@ -794,6 +799,11 @@ fn parse_f3_13_ms_and_sec(b: &[u8], cache: &FastDateCache) -> Option<(i64, i64)>
         let rel_ms = ts_abs_sec * 1_000 + sub_ms - cache.win_start_ms;
         Some((rel_ms, rel_ms.div_euclid(1_000)))
     }
+}
+
+#[inline(always)]
+pub unsafe fn parse_f3_13_ptr(p: *const u8, cache: &FastDateCache) -> Option<(i64, i64)> {
+    parse_f3_13_ms_and_sec(std::slice::from_raw_parts(p, 13), cache)
 }
 
 /// Fast timestamp parser returning `(ts_ms - win_start_ms, (ts_ms - win_start_ms).div_euclid(1000))`

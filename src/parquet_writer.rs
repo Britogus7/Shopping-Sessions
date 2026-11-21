@@ -442,23 +442,179 @@ fn encode_uid_rle_runs(uid_runs: &[u32], out: &mut Vec<u8>) {
 
 fn encode_u8_bitpacked(vals: &[u8], bw: u8, out: &mut Vec<u8>) {
     out.clear();
-    out.push(bw);
-    let bw_usize = bw as usize;
     let total_vals = vals.len();
-    let mut off = 0usize;
-    while off < total_vals {
-        let rem = total_vals - off;
-        let run_vals = rem.min(63 * 8);
-        let num_groups = (run_vals + 7) >> 3;
-        out.push(((num_groups << 1) | 1) as u8);
-        for _ in 0..num_groups {
-            let mut packed = 0u64;
-            let end = (off + 8).min(total_vals);
-            for (k, &v) in vals[off..end].iter().enumerate() {
-                packed |= (v as u64) << (k * bw_usize);
+    let bw_usize = bw as usize;
+    let total_groups = (total_vals + 7) >> 3;
+    let num_runs = (total_groups + 62) / 63;
+    out.reserve(1 + num_runs + total_groups * bw_usize + 8);
+    unsafe {
+        let mut dst = out.as_mut_ptr();
+        *dst = bw;
+        dst = dst.add(1);
+        let src = vals.as_ptr();
+        let mut off = 0usize;
+        while off < total_vals {
+            let rem = total_vals - off;
+            let run_vals = rem.min(63 * 8);
+            let num_groups = (run_vals + 7) >> 3;
+            *dst = ((num_groups << 1) | 1) as u8;
+            dst = dst.add(1);
+            let full_groups = run_vals >> 3;
+            for _ in 0..full_groups {
+                let p = src.add(off);
+                let v0 = *p as u64;
+                let v1 = *p.add(1) as u64;
+                let v2 = *p.add(2) as u64;
+                let v3 = *p.add(3) as u64;
+                let v4 = *p.add(4) as u64;
+                let v5 = *p.add(5) as u64;
+                let v6 = *p.add(6) as u64;
+                let v7 = *p.add(7) as u64;
+                let packed = match bw {
+                    1 => {
+                        v0 | (v1 << 1)
+                            | (v2 << 2)
+                            | (v3 << 3)
+                            | (v4 << 4)
+                            | (v5 << 5)
+                            | (v6 << 6)
+                            | (v7 << 7)
+                    }
+                    2 => {
+                        v0 | (v1 << 2)
+                            | (v2 << 4)
+                            | (v3 << 6)
+                            | (v4 << 8)
+                            | (v5 << 10)
+                            | (v6 << 12)
+                            | (v7 << 14)
+                    }
+                    3 => {
+                        v0 | (v1 << 3)
+                            | (v2 << 6)
+                            | (v3 << 9)
+                            | (v4 << 12)
+                            | (v5 << 15)
+                            | (v6 << 18)
+                            | (v7 << 21)
+                    }
+                    4 => {
+                        v0 | (v1 << 4)
+                            | (v2 << 8)
+                            | (v3 << 12)
+                            | (v4 << 16)
+                            | (v5 << 20)
+                            | (v6 << 24)
+                            | (v7 << 28)
+                    }
+                    5 => {
+                        v0 | (v1 << 5)
+                            | (v2 << 10)
+                            | (v3 << 15)
+                            | (v4 << 20)
+                            | (v5 << 25)
+                            | (v6 << 30)
+                            | (v7 << 35)
+                    }
+                    6 => {
+                        v0 | (v1 << 6)
+                            | (v2 << 12)
+                            | (v3 << 18)
+                            | (v4 << 24)
+                            | (v5 << 30)
+                            | (v6 << 36)
+                            | (v7 << 42)
+                    }
+                    7 => {
+                        v0 | (v1 << 7)
+                            | (v2 << 14)
+                            | (v3 << 21)
+                            | (v4 << 28)
+                            | (v5 << 35)
+                            | (v6 << 42)
+                            | (v7 << 49)
+                    }
+                    _ => (p as *const u64).read_unaligned(),
+                };
+                (dst as *mut u64).write_unaligned(packed.to_le());
+                dst = dst.add(bw_usize);
+                off += 8;
             }
-            out.extend_from_slice(&packed.to_le_bytes()[..bw_usize]);
-            off += 8;
+            if full_groups < num_groups {
+                let mut packed = 0u64;
+                let end = (off + 8).min(total_vals);
+                for (k, &v) in vals[off..end].iter().enumerate() {
+                    packed |= (v as u64) << (k * bw_usize);
+                }
+                (dst as *mut u64).write_unaligned(packed.to_le());
+                dst = dst.add(bw_usize);
+                off = end;
+            }
+        }
+        out.set_len(dst.offset_from(out.as_ptr()) as usize);
+    }
+}
+
+fn encode_u16_rle_hybrid(vals: &[u16], bw: u8, out: &mut Vec<u8>) {
+    out.clear();
+    let n = vals.len();
+    let bw_usize = bw as usize;
+    let wb = (bw_usize + 7) >> 3;
+    out.reserve(1 + n * wb + (n >> 3) + 64);
+    out.push(bw);
+    let mut i = 0usize;
+    while i < n {
+        let v0 = unsafe { *vals.get_unchecked(i) };
+        let mut r = i + 1;
+        while r < n && unsafe { *vals.get_unchecked(r) } == v0 {
+            r += 1;
+        }
+        let rlen = r - i;
+        if rlen >= 8 {
+            let mut hdr = (rlen as u32) << 1;
+            while hdr >= 0x80 {
+                out.push(((hdr as u8) & 0x7F) | 0x80);
+                hdr >>= 7;
+            }
+            out.push(hdr as u8);
+            let b = (v0 as u32).to_le_bytes();
+            out.extend_from_slice(&b[..wb]);
+            i = r;
+            continue;
+        }
+        let bp_start = i;
+        let mut groups = 0usize;
+        while i < n && groups < 63 {
+            if i + 8 <= n {
+                let vv = unsafe { *vals.get_unchecked(i) };
+                if unsafe {
+                    *vals.get_unchecked(i + 1) == vv
+                        && *vals.get_unchecked(i + 2) == vv
+                        && *vals.get_unchecked(i + 3) == vv
+                        && *vals.get_unchecked(i + 4) == vv
+                        && *vals.get_unchecked(i + 5) == vv
+                        && *vals.get_unchecked(i + 6) == vv
+                        && *vals.get_unchecked(i + 7) == vv
+                } {
+                    break;
+                }
+            }
+            i = (i + 8).min(n);
+            groups += 1;
+        }
+        if groups == 0 {
+            continue;
+        }
+        out.push(((groups << 1) | 1) as u8);
+        let mut pos = bp_start;
+        for _ in 0..groups {
+            let mut bits: u128 = 0;
+            let end = (pos + 8).min(n);
+            for k in 0..(end - pos) {
+                bits |= (unsafe { *vals.get_unchecked(pos + k) } as u128) << (k * bw_usize);
+            }
+            out.extend_from_slice(&bits.to_le_bytes()[..bw_usize]);
+            pos += 8;
         }
     }
 }
@@ -522,7 +678,9 @@ pub struct UserDailyParquetWriter {
     sess_ids: Vec<u8>,
     sess_rle_buf: Vec<u8>,
     col_events: Vec<i32>,
-    col_rev: Vec<i64>,
+    dict_rev: Vec<i64>,
+    rev_ids: Vec<u16>,
+    rev_rle_buf: Vec<u8>,
     def_bits: Vec<u8>,
     rle_buf: Vec<u8>,
     top_cat_ids: Vec<u8>,
@@ -609,7 +767,9 @@ impl UserDailyParquetWriter {
             sess_ids: Vec::new(),
             sess_rle_buf: Vec::new(),
             col_events: Vec::new(),
-            col_rev: Vec::new(),
+            dict_rev: vec![0i64],
+            rev_ids: Vec::new(),
+            rev_rle_buf: Vec::new(),
             def_bits: Vec::new(),
             rle_buf: Vec::new(),
             top_cat_ids: Vec::new(),
@@ -637,7 +797,7 @@ impl UserDailyParquetWriter {
                 }
                 touch(self.col_sessions.as_mut_ptr() as *mut u8, n * 4);
                 touch(self.col_events.as_mut_ptr() as *mut u8, n * 4);
-                touch(self.col_rev.as_mut_ptr() as *mut u8, n * 8);
+                touch(self.rev_ids.as_mut_ptr() as *mut u8, n * 2);
                 touch(self.def_bits.as_mut_ptr(), (n + 7) >> 3);
                 touch(self.dict_uid.as_mut_ptr(), self.dict_uid.capacity().min(n * 4));
                 touch(self.uid_runs.as_mut_ptr() as *mut u8, self.uid_runs.capacity().min(n) * 4);
@@ -653,6 +813,7 @@ impl UserDailyParquetWriter {
         if self.rg_rows >= MAX_RG_ROWS
             || self.dict_uid.len() >= MAX_VAR_BYTES
             || self.top_cat_vals.len() >= MAX_VAR_BYTES
+            || self.dict_rev.len() >= 65_535
         {
             self.flush_rg();
         }
@@ -667,7 +828,7 @@ impl UserDailyParquetWriter {
                     }
                     self.col_sessions.set_len(nr);
                     self.col_events.set_len(nr);
-                    self.col_rev.set_len(nr);
+                    self.rev_ids.set_len(nr);
                     self.def_bits.set_len((nr + 7) >> 3);
                 }
             }
@@ -680,6 +841,7 @@ impl UserDailyParquetWriter {
                 self.dict_uid
                     .reserve((target * 4 + 64).min(MAX_VAR_BYTES + 64).max(65_536));
                 self.uid_runs.reserve(target);
+                self.dict_rev.reserve(4096);
                 if self.use_cat_dict {
                     self.top_cat_ids.reserve(target);
                 } else {
@@ -694,7 +856,7 @@ impl UserDailyParquetWriter {
             }
             self.col_sessions.reserve(target - nr);
             self.col_events.reserve(target - nr);
-            self.col_rev.reserve(target - nr);
+            self.rev_ids.reserve(target - nr);
             let cur_def = (nr + 7) >> 3;
             let req_def = ((target + 7) >> 3) + 1;
             if req_def > cur_def {
@@ -718,6 +880,7 @@ impl UserDailyParquetWriter {
         if self.rg_rows >= self.cap_rows
             || self.dict_uid.len() >= MAX_VAR_BYTES
             || self.top_cat_vals.len() >= MAX_VAR_BYTES
+            || self.dict_rev.len() >= 65_535
         {
             self.ensure_cap_or_flush();
         }
@@ -763,7 +926,13 @@ impl UserDailyParquetWriter {
             }
             *self.col_sessions.as_mut_ptr().add(idx) = sessions;
             *self.col_events.as_mut_ptr().add(idx) = events;
-            *self.col_rev.as_mut_ptr().add(idx) = revenue;
+            if revenue == 0 {
+                *self.rev_ids.as_mut_ptr().add(idx) = 0;
+            } else {
+                let rid = self.dict_rev.len() as u16;
+                self.dict_rev.push(revenue);
+                *self.rev_ids.as_mut_ptr().add(idx) = rid;
+            }
 
             if (idx & 7) == 0 {
                 *self.def_bits.as_mut_ptr().add(idx >> 3) = 0;
@@ -795,7 +964,7 @@ impl UserDailyParquetWriter {
             }
             self.col_sessions.set_len(nr_usize);
             self.col_events.set_len(nr_usize);
-            self.col_rev.set_len(nr_usize);
+            self.rev_ids.set_len(nr_usize);
             self.def_bits.set_len((nr_usize + 7) >> 3);
         }
         let is_first = self.file.is_none();
@@ -868,7 +1037,15 @@ impl UserDailyParquetWriter {
             p2_plain
         };
         let p3_data = as_le_bytes(&self.col_events);
-        let p4_data = as_le_bytes(&self.col_rev);
+        let rev_dict_len = self.dict_rev.len();
+        let rev_bw = if rev_dict_len <= 2 {
+            1u8
+        } else {
+            (32 - ((rev_dict_len - 1) as u32).leading_zeros()) as u8
+        };
+        encode_u16_rle_hybrid(&self.rev_ids, rev_bw, &mut self.rev_rle_buf);
+        let p4_dict = as_le_bytes(&self.dict_rev);
+        let p4_data = self.rev_rle_buf.as_slice();
         let p5_vals: &[u8] = if emit_cat_dict {
             &self.cat_rle_buf
         } else {
@@ -924,7 +1101,14 @@ impl UserDailyParquetWriter {
             &mut self.hdr_buf,
         );
         let h3 = append_data_page_header_enc(nr, p3_data.len() as i32, ENC_PLAIN, &mut self.hdr_buf);
-        let h4 = append_data_page_header_enc(nr, p4_data.len() as i32, ENC_PLAIN, &mut self.hdr_buf);
+        let dh4 =
+            append_dict_page_header(rev_dict_len as i32, p4_dict.len() as i32, &mut self.hdr_buf);
+        let h4 = append_data_page_header_enc(
+            nr,
+            p4_data.len() as i32,
+            ENC_RLE_DICTIONARY,
+            &mut self.hdr_buf,
+        );
         let dh5 = if emit_cat_dict {
             append_dict_page_header(
                 self.num_cats as i32,
@@ -994,7 +1178,7 @@ impl UserDailyParquetWriter {
                 p2_data,
             ),
             (3usize, false, (0, 0), &[][..], h3, p3_data),
-            (4usize, false, (0, 0), &[][..], h4, p4_data),
+            (4usize, true, dh4, p4_dict, h4, p4_data),
         ] {
             let dh_s = &hb[dh_rng.0..dh_rng.1];
             let h_s = &hb[h_rng.0..h_rng.1];
@@ -1070,7 +1254,9 @@ impl UserDailyParquetWriter {
         self.day_ids.clear();
         self.col_sessions.clear();
         self.col_events.clear();
-        self.col_rev.clear();
+        self.rev_ids.clear();
+        self.dict_rev.clear();
+        self.dict_rev.push(0);
         self.def_bits.clear();
         self.top_cat_ids.clear();
         self.top_cat_vals.clear();
@@ -1312,6 +1498,52 @@ mod tests {
         let b_fb = std::fs::read(&p_fb).unwrap();
         assert!(b_fb.starts_with(b"PAR1"));
         assert!(b_fb.ends_with(b"PAR1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_daily_rev_rle_dict_all_zero_dups_and_split() {
+        let dir = std::env::temp_dir().join("shopping_pq_rev_rle_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cats = vec!["apparel".to_string(), "books".to_string()];
+
+        // 1) All-zero revenues (only dict[0] = 0 -> bw=1 RLE run)
+        let p_z = dir.join("all_zero.parquet");
+        let mut wr_z = UserDailyParquetWriter::new(p_z.clone(), &cats, 21_000, 14, 4096);
+        for i in 0..1000i32 {
+            let uid = format!("z_{i:05}");
+            wr_z.push_user_day(uid.as_bytes(), false, 21_000 + (i % 14), 1, 2, 0, None);
+        }
+        assert!(wr_z.close());
+        let b_z = std::fs::read(&p_z).unwrap();
+        assert!(b_z.starts_with(b"PAR1") && b_z.ends_with(b"PAR1"));
+
+        // 2) > 65,535 non-zero revenues triggering automatic dict_rev RG split + alternating zeros & non-zeros
+        let p_sp = dir.join("rev_split.parquet");
+        let mut wr_s = UserDailyParquetWriter::new(p_sp.clone(), &cats, 21_000, 14, 4096);
+        for i in 0..70_000i32 {
+            let uid = format!("s_{i:06}");
+            let rev = if i % 9 == 0 {
+                (100 + (i % 50)) as i64
+            } else if i < 66_000 {
+                (1000 + i) as i64
+            } else {
+                0
+            };
+            wr_s.push_user_day(
+                uid.as_bytes(),
+                false,
+                21_000 + (i % 14),
+                1,
+                3,
+                rev,
+                if rev > 0 { Some((i as usize) % cats.len()) } else { None },
+            );
+        }
+        assert!(wr_s.close());
+        let b_sp = std::fs::read(&p_sp).unwrap();
+        assert!(b_sp.starts_with(b"PAR1") && b_sp.ends_with(b"PAR1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

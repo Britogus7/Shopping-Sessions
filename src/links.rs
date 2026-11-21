@@ -10,11 +10,11 @@ use std::sync::atomic::{
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::csv::{scan_csv_mmap_chunk, scan_csv_mmap_chunk_sink, CsvRowSink};
+use crate::csv::{parse_csv_line, scan_csv_mmap_chunk, scan_csv_mmap_chunk_sink, CsvRowSink};
 use crate::huge::HugeZeroed;
 use crate::pack::{
-    decode_canon_val, encode_canon_val, link_hash, mix64, pack_b37_pair, OverflowInterner,
-    B37_LIMIT, EMPTY_KEY,
+    decode_canon_val, encode_canon_val, link_hash, mix64, pack_b37_pair, pack_b37_pair_89,
+    OverflowInterner, B37_LIMIT, EMPTY_KEY,
 };
 
 #[repr(C)]
@@ -1109,6 +1109,123 @@ fn build_link_redirect_st(
     }
 }
 
+#[cold]
+#[inline(never)]
+fn fallback_link_line(
+    data: &[u8],
+    line_start: usize,
+    stop_excl: usize,
+    sink: &mut LinkSink<'_>,
+) -> usize {
+    let rem = &data[line_start..stop_excl];
+    if let Some(rel) = memchr::memchr(b'\n', rem) {
+        if let Some(row) = parse_csv_line::<2>(&rem[..rel]) {
+            sink.on_row(&row);
+        }
+        line_start + rel + 1
+    } else {
+        if !rem.is_empty() {
+            if let Some(row) = parse_csv_line::<2>(rem) {
+                sink.on_row(&row);
+            }
+        }
+        stop_excl
+    }
+}
+
+/// Direct single-pass links CSV scanner bypassing 4 KB intermediate delimiter buffers
+/// on 8/9-byte `'u'`-prefixed lines while falling back line-by-line cleanly.
+#[inline(never)]
+unsafe fn scan_links_direct(data: &[u8], start: usize, end: usize, sink: &mut LinkSink<'_>) {
+    if start >= end || start >= data.len() {
+        return;
+    }
+    let end = end.min(data.len());
+    let start_pos = if start == 0 {
+        let Some(nl) = memchr::memchr(b'\n', data) else {
+            return;
+        };
+        nl + 1
+    } else {
+        let Some(rel) = memchr::memchr(b'\n', &data[start - 1..]) else {
+            return;
+        };
+        start + rel
+    };
+    if start_pos >= end {
+        return;
+    }
+    let stop_excl = if let Some(rel) = memchr::memchr(b'\n', &data[end - 1..]) {
+        end + rel
+    } else {
+        data.len()
+    };
+
+    let base = data.as_ptr();
+    let mut cur = start_pos;
+    let safe_limit = stop_excl.saturating_sub(32);
+
+    'outer: while cur < safe_limit {
+        if sink.overflowed_ref.load(MemOrdering::Relaxed) {
+            return;
+        }
+        let line_start = cur;
+        let mut p = base.add(cur);
+        'fast: {
+            let q0 = usize::from(*p == b'"');
+            p = p.add(q0);
+            let a_p = p;
+            let is9_0 = usize::from(*p.add(8) >= b'0');
+            let len0 = 8 + is9_0;
+            let ok0 = (*p == b'u') & (*p.add(len0 + q0) == b',') & ((q0 == 0) | (*p.add(len0) == b'"'));
+            p = p.add(len0 + q0 + 1);
+
+            let q1 = usize::from(*p == b'"');
+            p = p.add(q1);
+            let b_p = p;
+            let is9_1 = usize::from(*p.add(8) >= b'0');
+            let len1 = 8 + is9_1;
+            let ok1 = (*p == b'u') & (*p.add(len1 + q1) == b'\n') & ((q1 == 0) | (*p.add(len1) == b'"'));
+            p = p.add(len1 + q1 + 1);
+
+            if !(ok0 & ok1) {
+                break 'fast;
+            }
+            let Some((ka, kb)) = pack_b37_pair_89(a_p, is9_0, b_p, is9_1) else {
+                break 'fast;
+            };
+            if ka != kb {
+                sink.local_edges = true;
+                sink.edge_batch[sink.batch_len] = (ka, kb);
+                sink.batch_len += 1;
+                if sink.batch_len == 32 {
+                    flush_edge_batch(
+                        &sink.edge_batch,
+                        sink.keys_ref,
+                        sink.parent_ref,
+                        sink.mask,
+                        sink.overflow,
+                        &mut sink.local_added,
+                        sink.global_nodes_ref,
+                        sink.max_nodes,
+                        sink.overflowed_ref,
+                    );
+                    sink.batch_len = 0;
+                }
+            }
+            cur = p.offset_from(base) as usize;
+            continue 'outer;
+        }
+        cur = fallback_link_line(data, line_start, stop_excl, sink);
+    }
+    while cur < stop_excl {
+        if sink.overflowed_ref.load(MemOrdering::Relaxed) {
+            return;
+        }
+        cur = fallback_link_line(data, cur, stop_excl, sink);
+    }
+}
+
 pub fn build_link_redirect(
     link_files: &[PathBuf],
     num_threads: usize,
@@ -1209,7 +1326,9 @@ pub fn build_link_redirect(
                     let Some(&(fidx, start, end)) = jobs_ref.get(jid) else {
                         break;
                     };
-                    scan_csv_mmap_chunk_sink::<2, _>(&mmaps_ref[fidx], start, end, &mut sink);
+                    unsafe {
+                        scan_links_direct(&mmaps_ref[fidx], start, end, &mut sink);
+                    }
                     sink.flush_tail();
                 }
                 if sink.local_edges {
