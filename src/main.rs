@@ -1,6 +1,7 @@
 mod csv;
 mod links;
 mod pack;
+mod parquet_writer;
 mod pipeline;
 
 use std::env;

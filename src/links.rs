@@ -1,11 +1,11 @@
-//! Parallel SIMD link parsing, 64-bucket L2-resident node deduplication,
-//! lock-free union-by-min-key DSU, and compact `LinkRedirect` lookup table.
+//! Direct 2-pass lock-free DSU link resolver (with 3-bit register-blocked Bloom filter)
+//! and cold bucketed fallback for adversarially dense short-ID inputs.
 
 use std::cmp::Ordering;
 use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering as MemOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as MemOrdering};
 
 use memmap2::{Mmap, MmapOptions};
 
@@ -28,37 +28,80 @@ struct AtomicRedirectSlot {
 const _: () = {
     assert!(std::mem::size_of::<AtomicRedirectSlot>() == std::mem::size_of::<RedirectSlot>());
     assert!(std::mem::align_of::<AtomicRedirectSlot>() == std::mem::align_of::<RedirectSlot>());
+    assert!(std::mem::size_of::<AtomicRedirectSlot>() == 16);
+    assert!(std::mem::align_of::<AtomicRedirectSlot>() == 8);
 };
 
 pub struct LinkRedirect {
     bitset: Vec<u64>,
-    bmask: usize,
+    wmask: usize,
     slots: Vec<RedirectSlot>,
     smask: usize,
+}
+
+#[inline(always)]
+fn bloom_word_and_mask(h: u64, wmask: usize) -> (usize, u64) {
+    let w = (h as usize) & wmask;
+    let m = (1u64 << ((h >> 46) & 63))
+        | (1u64 << ((h >> 52) & 63))
+        | (1u64 << ((h >> 58) & 63));
+    (w, m)
+}
+
+#[inline(always)]
+fn alloc_zeroed_vec<T>(len: usize) -> Vec<T> {
+    let layout = std::alloc::Layout::array::<T>(len).unwrap();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe { Vec::from_raw_parts(ptr as *mut T, len, len) }
 }
 
 impl LinkRedirect {
     pub fn empty() -> Self {
         Self {
             bitset: Vec::new(),
-            bmask: 0,
+            wmask: 0,
             slots: Vec::new(),
             smask: 0,
         }
     }
 
     #[inline(always)]
-    pub fn resolve(&self, k: u64) -> u64 {
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn bloom_hit_slot(&self, k: u64) -> Option<usize> {
         if self.slots.is_empty() {
-            return k;
+            return None;
         }
         let h = mix64(k);
-        let bit_idx = (h as usize) & self.bmask;
-        let word = unsafe { *self.bitset.get_unchecked(bit_idx >> 6) };
-        if ((word >> (bit_idx & 63)) & 1) == 0 {
-            return k;
+        let (w, m) = bloom_word_and_mask(h, self.wmask);
+        let word = unsafe { *self.bitset.get_unchecked(w) };
+        if (word & m) != m {
+            return None;
         }
-        let mut idx = (h as usize) & self.smask;
+        Some(((h >> 20) as usize) & self.smask)
+    }
+
+    #[inline(always)]
+    pub fn prefetch_slot(&self, idx: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                self.slots.as_ptr().add(idx) as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = idx;
+    }
+
+    #[inline(always)]
+    pub fn resolve_from_slot(&self, k: u64, mut idx: usize) -> u64 {
         loop {
             let slot = unsafe { *self.slots.get_unchecked(idx) };
             if slot.key == k {
@@ -70,45 +113,90 @@ impl LinkRedirect {
             idx = (idx + 1) & self.smask;
         }
     }
-}
 
-struct BucketDict {
-    slots: Vec<(u64, u32)>,
-    mask: usize,
-    base_id: u32,
-}
-
-impl BucketDict {
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
-    fn lookup_global(&self, k: u64) -> u32 {
-        let mut idx = (mix64(k) as usize) & self.mask;
-        loop {
-            let (sk, local_id) = unsafe { *self.slots.get_unchecked(idx) };
-            if sk == k {
-                return self.base_id + local_id;
-            }
-            idx = (idx + 1) & self.mask;
-        }
+    pub fn resolve(&self, k: u64) -> u64 {
+        let Some(idx) = self.bloom_hit_slot(k) else {
+            return k;
+        };
+        self.resolve_from_slot(k, idx)
     }
 }
 
 #[inline(always)]
-fn find_root(parent: &[AtomicU32], mut x: u32) -> u32 {
+fn intern_node(
+    keys: &[AtomicU64],
+    mask: usize,
+    k: u64,
+    local_added: &mut usize,
+    global_nodes: &AtomicUsize,
+    max_nodes: usize,
+    overflowed: &AtomicBool,
+) -> Option<u32> {
+    let mut pos = (mix64(k) as usize) & mask;
+    let mut probes = 0usize;
     loop {
-        let p = parent[x as usize].load(MemOrdering::Relaxed);
-        if p == x {
-            let p2 = parent[x as usize].load(MemOrdering::Acquire);
-            if p2 == x {
+        let cur = unsafe { keys.get_unchecked(pos) }.load(MemOrdering::Acquire);
+        if cur == k {
+            return Some(pos as u32);
+        }
+        if cur == EMPTY_KEY {
+            match unsafe { keys.get_unchecked(pos) }.compare_exchange(
+                EMPTY_KEY,
+                k,
+                MemOrdering::AcqRel,
+                MemOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    *local_added += 1;
+                    if *local_added >= 16 {
+                        let prev = global_nodes.fetch_add(*local_added, MemOrdering::Relaxed);
+                        let added = *local_added;
+                        *local_added = 0;
+                        if prev + added > max_nodes {
+                            overflowed.store(true, MemOrdering::Relaxed);
+                            return None;
+                        }
+                    }
+                    return Some(pos as u32);
+                }
+                Err(actual) => {
+                    if actual == k {
+                        return Some(pos as u32);
+                    }
+                }
+            }
+        }
+        probes += 1;
+        if probes > 1024 {
+            if overflowed.load(MemOrdering::Relaxed) || probes > mask {
+                overflowed.store(true, MemOrdering::Relaxed);
+                return None;
+            }
+        }
+        pos = (pos + 1) & mask;
+    }
+}
+
+#[inline(always)]
+fn find_root_zero(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p_raw = unsafe { parent.get_unchecked(x as usize) }.load(MemOrdering::Relaxed);
+        if p_raw == 0 {
+            let p2 = unsafe { parent.get_unchecked(x as usize) }.load(MemOrdering::Acquire);
+            if p2 == 0 {
                 return x;
             }
-            x = p2;
+            x = p2 - 1;
             continue;
         }
-        let gp = parent[p as usize].load(MemOrdering::Relaxed);
-        if gp != p {
-            let _ = parent[x as usize].compare_exchange_weak(
-                p,
-                gp,
+        let p = p_raw - 1;
+        let gp_raw = unsafe { parent.get_unchecked(p as usize) }.load(MemOrdering::Relaxed);
+        if gp_raw != 0 {
+            let _ = unsafe { parent.get_unchecked(x as usize) }.compare_exchange_weak(
+                p_raw,
+                gp_raw,
                 MemOrdering::Relaxed,
                 MemOrdering::Relaxed,
             );
@@ -117,19 +205,27 @@ fn find_root(parent: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
-#[inline]
-fn union_min(parent: &[AtomicU32], keys: &[u64], overflow: &OverflowInterner, a: u32, b: u32) {
+#[inline(always)]
+fn union_min_zero(
+    parent: &[AtomicU32],
+    keys: &[AtomicU64],
+    overflow: &OverflowInterner,
+    a: u32,
+    b: u32,
+) {
     loop {
-        let mut u = find_root(parent, a);
-        let mut v = find_root(parent, b);
+        let mut u = find_root_zero(parent, a);
+        let mut v = find_root_zero(parent, b);
         if u == v {
             return;
         }
-        if overflow.cmp_key(keys[v as usize], keys[u as usize]) == Ordering::Less {
+        let ku = unsafe { keys.get_unchecked(u as usize) }.load(MemOrdering::Acquire);
+        let kv = unsafe { keys.get_unchecked(v as usize) }.load(MemOrdering::Acquire);
+        if overflow.cmp_key(kv, ku) == Ordering::Less {
             std::mem::swap(&mut u, &mut v);
         }
-        if parent[v as usize]
-            .compare_exchange(v, u, MemOrdering::AcqRel, MemOrdering::Acquire)
+        if unsafe { parent.get_unchecked(v as usize) }
+            .compare_exchange(0, u + 1, MemOrdering::AcqRel, MemOrdering::Acquire)
             .is_ok()
         {
             return;
@@ -137,15 +233,80 @@ fn union_min(parent: &[AtomicU32], keys: &[u64], overflow: &OverflowInterner, a:
     }
 }
 
-struct ThreadLinkData {
-    edges: Vec<(u64, u64)>,
-    key_buckets: Vec<Vec<u64>>,
+fn finalize_redirect_from_pairs<F>(
+    num_redirects: usize,
+    fill: F,
+) -> LinkRedirect
+where
+    F: FnOnce(&[AtomicRedirectSlot], &[AtomicU64], usize, usize),
+{
+    if num_redirects == 0 {
+        return LinkRedirect::empty();
+    }
+    let slots_cap = (num_redirects * 10 / 7)
+        .max(num_redirects + 64)
+        .next_power_of_two()
+        .max(64);
+    let smask = slots_cap - 1;
+    let atomic_slots: Vec<AtomicRedirectSlot> = alloc_zeroed_vec(slots_cap);
+
+    let num_words = (num_redirects / 4).next_power_of_two().clamp(64, 1 << 18);
+    let wmask = num_words - 1;
+    let atomic_bitset: Vec<AtomicU64> = alloc_zeroed_vec(num_words);
+
+    fill(&atomic_slots, &atomic_bitset, smask, wmask);
+
+    let mut md_slots = ManuallyDrop::new(atomic_slots);
+    let slots = unsafe {
+        Vec::from_raw_parts(
+            md_slots.as_mut_ptr() as *mut RedirectSlot,
+            md_slots.len(),
+            md_slots.capacity(),
+        )
+    };
+    let mut md_bs = ManuallyDrop::new(atomic_bitset);
+    let bitset = unsafe {
+        Vec::from_raw_parts(
+            md_bs.as_mut_ptr() as *mut u64,
+            md_bs.len(),
+            md_bs.capacity(),
+        )
+    };
+
+    LinkRedirect {
+        bitset,
+        wmask,
+        slots,
+        smask,
+    }
 }
 
-struct BucketDedupResult {
-    unique_keys: Vec<u64>,
-    slots: Vec<(u64, u32)>,
-    mask: usize,
+#[inline(always)]
+fn insert_redirect_slot(
+    asl: &[AtomicRedirectSlot],
+    abs: &[AtomicU64],
+    smask: usize,
+    wmask: usize,
+    key: u64,
+    canon: u64,
+) {
+    let h = mix64(key);
+    let (w, m) = bloom_word_and_mask(h, wmask);
+    unsafe { abs.get_unchecked(w) }.fetch_or(m, MemOrdering::Relaxed);
+
+    let mut idx = ((h >> 20) as usize) & smask;
+    loop {
+        let s_ref = unsafe { asl.get_unchecked(idx) };
+        if s_ref
+            .key
+            .compare_exchange(EMPTY_KEY, key, MemOrdering::Relaxed, MemOrdering::Relaxed)
+            .is_ok()
+        {
+            s_ref.val.store(canon, MemOrdering::Relaxed);
+            break;
+        }
+        idx = (idx + 1) & smask;
+    }
 }
 
 pub fn build_link_redirect(
@@ -172,10 +333,12 @@ pub fn build_link_redirect(
         })
         .collect();
 
+    let mut total_link_bytes = 0usize;
     let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
     const CHUNK_BYTES: usize = 1024 * 1024;
     for (fidx, m) in mmaps.iter().enumerate() {
         let len = m.len();
+        total_link_bytes += len;
         let mut pos = 0usize;
         while pos < len {
             let end = (pos + CHUNK_BYTES).min(len);
@@ -188,13 +351,282 @@ pub fn build_link_redirect(
         return LinkRedirect::empty();
     }
 
+    let nt = num_threads.max(1);
+    let cap = ((total_link_bytes / 12).max(4096)).next_power_of_two();
+    let mask = cap - 1;
+    let max_nodes = (cap * 3) / 4;
+
+    let keys: Vec<AtomicU64> = alloc_zeroed_vec(cap);
+    let parent: Vec<AtomicU32> = alloc_zeroed_vec(cap);
+    let global_nodes = AtomicUsize::new(0);
+    let overflowed = AtomicBool::new(false);
+    let has_edges = AtomicBool::new(false);
+    let next_job = AtomicUsize::new(0);
+
+    // Pass 1: Read CSV chunks and execute lock-free DSU directly inside flat hash table
+    std::thread::scope(|s| {
+        let read_nt = nt.min(jobs.len());
+        let mut handles = Vec::with_capacity(read_nt);
+        let mmaps_ref = &mmaps;
+        let jobs_ref = &jobs;
+        let next_job_ref = &next_job;
+        let keys_ref = &keys;
+        let parent_ref = &parent;
+        let global_nodes_ref = &global_nodes;
+        let overflowed_ref = &overflowed;
+        let has_edges_ref = &has_edges;
+
+        for _ in 0..read_nt {
+            handles.push(s.spawn(move || {
+                let mut local_added = 0usize;
+                let mut local_edges = false;
+                loop {
+                    if overflowed_ref.load(MemOrdering::Relaxed) {
+                        break;
+                    }
+                    let jid = next_job_ref.fetch_add(1, MemOrdering::Relaxed);
+                    let Some(&(fidx, start, end)) = jobs_ref.get(jid) else {
+                        break;
+                    };
+                    scan_csv_mmap_chunk::<2, _>(&mmaps_ref[fidx], start, end, |&[a, b]| {
+                        if overflowed_ref.load(MemOrdering::Relaxed) {
+                            return;
+                        }
+                        if !a.is_empty() && !b.is_empty() {
+                            let ka = overflow.encode(a);
+                            let kb = overflow.encode(b);
+                            if ka != kb {
+                                local_edges = true;
+                                let Some(ia) = intern_node(
+                                    keys_ref,
+                                    mask,
+                                    ka,
+                                    &mut local_added,
+                                    global_nodes_ref,
+                                    max_nodes,
+                                    overflowed_ref,
+                                ) else {
+                                    return;
+                                };
+                                let Some(ib) = intern_node(
+                                    keys_ref,
+                                    mask,
+                                    kb,
+                                    &mut local_added,
+                                    global_nodes_ref,
+                                    max_nodes,
+                                    overflowed_ref,
+                                ) else {
+                                    return;
+                                };
+                                union_min_zero(parent_ref, keys_ref, overflow, ia, ib);
+                            }
+                        }
+                    });
+                }
+                if local_edges {
+                    has_edges_ref.store(true, MemOrdering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    if overflowed.load(MemOrdering::Relaxed) {
+        drop(keys);
+        drop(parent);
+        return build_link_redirect_fallback(&mmaps, &jobs, nt, overflow);
+    }
+
+    if !has_edges.load(MemOrdering::Relaxed) {
+        if total_link_bytes < 256 * 1024 * 1024 {
+            std::mem::forget(keys);
+            std::mem::forget(parent);
+            std::mem::forget(mmaps);
+        }
+        return LinkRedirect::empty();
+    }
+
+    // Pass 2a: Parallel path compression over non-root nodes in 0..cap
+    let chunk_n = (cap + nt - 1) / nt;
+    let redirect_count = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(nt);
+        for t in 0..nt {
+            let start = t * chunk_n;
+            if start >= cap {
+                break;
+            }
+            let end = (start + chunk_n).min(cap);
+            let p_ref = &parent;
+            let rc_ref = &redirect_count;
+            handles.push(s.spawn(move || {
+                let mut local_redir = 0usize;
+                for i in start..end {
+                    let p_raw = unsafe { p_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
+                    if p_raw != 0 {
+                        let mut r = (p_raw - 1) as usize;
+                        loop {
+                            let pr = unsafe { p_ref.get_unchecked(r) }.load(MemOrdering::Relaxed);
+                            if pr == 0 {
+                                break;
+                            }
+                            r = (pr - 1) as usize;
+                        }
+                        if r + 1 != p_raw as usize {
+                            unsafe { p_ref.get_unchecked(i) }
+                                .store((r + 1) as u32, MemOrdering::Relaxed);
+                        }
+                        local_redir += 1;
+                    }
+                }
+                rc_ref.fetch_add(local_redir, MemOrdering::Relaxed);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    let num_redirects = redirect_count.into_inner();
+    let res = finalize_redirect_from_pairs(num_redirects, |asl, abs, smask, wmask| {
+        // Pass 2b: Scatter (key -> canonical_min_key) into LinkRedirect in parallel
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(nt);
+            for t in 0..nt {
+                let start = t * chunk_n;
+                if start >= cap {
+                    break;
+                }
+                let end = (start + chunk_n).min(cap);
+                let p_ref = &parent;
+                let k_ref = &keys;
+                handles.push(s.spawn(move || {
+                    for i in start..end {
+                        let p_raw = unsafe { p_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
+                        if p_raw != 0 {
+                            let key = unsafe { k_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
+                            let canon = unsafe { k_ref.get_unchecked((p_raw - 1) as usize) }
+                                .load(MemOrdering::Relaxed);
+                            insert_redirect_slot(asl, abs, smask, wmask, key, canon);
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    });
+
+    if total_link_bytes < 256 * 1024 * 1024 {
+        std::mem::forget(keys);
+        std::mem::forget(parent);
+        std::mem::forget(mmaps);
+    }
+    res
+}
+
+// =========================================================================
+// Cold Fallback: Bucketed DSU for Ultra-Dense / Short-ID Adversarial Links
+// =========================================================================
+
+struct BucketDict {
+    slots: Vec<(u64, u32)>,
+    mask: usize,
+    base_id: u32,
+}
+
+impl BucketDict {
+    #[inline(always)]
+    fn lookup_global(&self, k: u64) -> u32 {
+        let mut idx = ((mix64(k) >> 16) as usize) & self.mask;
+        loop {
+            let (sk, local_id) = unsafe { *self.slots.get_unchecked(idx) };
+            if sk == k {
+                return self.base_id + local_id;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
+#[inline(always)]
+fn find_root_dense(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(MemOrdering::Relaxed);
+        if p == x {
+            let p2 = parent[x as usize].load(MemOrdering::Acquire);
+            if p2 == x {
+                return x;
+            }
+            x = p2;
+            continue;
+        }
+        let gp = parent[p as usize].load(MemOrdering::Relaxed);
+        if gp != p {
+            let _ = parent[x as usize].compare_exchange_weak(
+                p,
+                gp,
+                MemOrdering::Relaxed,
+                MemOrdering::Relaxed,
+            );
+        }
+        x = p;
+    }
+}
+
+#[inline]
+fn union_min_dense(
+    parent: &[AtomicU32],
+    keys: &[u64],
+    overflow: &OverflowInterner,
+    a: u32,
+    b: u32,
+) {
+    loop {
+        let mut u = find_root_dense(parent, a);
+        let mut v = find_root_dense(parent, b);
+        if u == v {
+            return;
+        }
+        if overflow.cmp_key(keys[v as usize], keys[u as usize]) == Ordering::Less {
+            std::mem::swap(&mut u, &mut v);
+        }
+        if parent[v as usize]
+            .compare_exchange(v, u, MemOrdering::AcqRel, MemOrdering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+struct ThreadLinkData {
+    edges: Vec<(u64, u64)>,
+    key_buckets: Vec<Vec<u64>>,
+}
+
+struct BucketDedupResult {
+    unique_keys: Vec<u64>,
+    slots: Vec<(u64, u32)>,
+    mask: usize,
+}
+
+#[cold]
+fn build_link_redirect_fallback(
+    mmaps: &[Mmap],
+    jobs: &[(usize, usize, usize)],
+    num_threads: usize,
+    overflow: &OverflowInterner,
+) -> LinkRedirect {
     let nt = num_threads.max(1).min(jobs.len());
     let next_job = AtomicUsize::new(0);
 
     let thread_data: Vec<ThreadLinkData> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(nt);
-        let mmaps_ref = &mmaps;
-        let jobs_ref = &jobs;
         let next_job_ref = &next_job;
         for _ in 0..nt {
             handles.push(s.spawn(move || {
@@ -202,10 +634,10 @@ pub fn build_link_redirect(
                 let mut key_buckets: Vec<Vec<u64>> = (0..64).map(|_| Vec::new()).collect();
                 loop {
                     let jid = next_job_ref.fetch_add(1, MemOrdering::Relaxed);
-                    let Some(&(fidx, start, end)) = jobs_ref.get(jid) else {
+                    let Some(&(fidx, start, end)) = jobs.get(jid) else {
                         break;
                     };
-                    scan_csv_mmap_chunk::<2, _>(&mmaps_ref[fidx], start, end, |[a, b]| {
+                    scan_csv_mmap_chunk::<2, _>(&mmaps[fidx], start, end, |&[a, b]| {
                         if !a.is_empty() && !b.is_empty() {
                             let ka = overflow.encode(a);
                             let kb = overflow.encode(b);
@@ -222,16 +654,12 @@ pub fn build_link_redirect(
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    drop(mmaps);
-    drop(jobs);
 
     let total_edges: usize = thread_data.iter().map(|t| t.edges.len()).sum();
     if total_edges == 0 {
         return LinkRedirect::empty();
     }
 
-    // Parallel node deduplication across the 64 key buckets.
-    // Transpose key_buckets cleanly into 64 owned bucket lists so every worker mutates disjoint slices.
     let mut bucket_inputs: Vec<Vec<Vec<u64>>> = (0..64).map(|_| Vec::with_capacity(nt)).collect();
     let mut thread_edges: Vec<Vec<(u64, u64)>> = Vec::with_capacity(nt);
     for td in thread_data {
@@ -266,14 +694,14 @@ pub fn build_link_redirect(
                     continue;
                 }
                 let raw_cnt: usize = raw_vecs.iter().map(|v| v.len()).sum();
-                let mut cap = 64usize.max((raw_cnt / 2).next_power_of_two());
+                let mut cap = 64usize.max(((raw_cnt * 3) / 2).next_power_of_two());
                 let mut slots = vec![(EMPTY_KEY, 0u32); cap];
                 let mut mask = cap - 1;
                 let mut unique_keys: Vec<u64> = Vec::with_capacity(raw_cnt / 2);
 
                 for v in raw_vecs {
                     for &k in v {
-                        let mut idx = (mix64(k) as usize) & mask;
+                        let mut idx = ((mix64(k) >> 16) as usize) & mask;
                         let mut found = false;
                         loop {
                             let (sk, _) = slots[idx];
@@ -296,7 +724,7 @@ pub fn build_link_redirect(
                                 let mut new_slots = vec![(EMPTY_KEY, 0u32); new_cap];
                                 for &(ok, olid) in &slots {
                                     if ok != EMPTY_KEY {
-                                        let mut nidx = (mix64(ok) as usize) & new_mask;
+                                        let mut nidx = ((mix64(ok) >> 16) as usize) & new_mask;
                                         while new_slots[nidx].0 != EMPTY_KEY {
                                             nidx = (nidx + 1) & new_mask;
                                         }
@@ -345,7 +773,6 @@ pub fn build_link_redirect(
     }
     drop(unique_per_bucket);
 
-    // Parallel Lock-Free Union-by-Min-Key
     let parent: Vec<AtomicU32> = (0..num_nodes as u32).map(AtomicU32::new).collect();
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(thread_edges.len());
@@ -357,7 +784,7 @@ pub fn build_link_redirect(
                 for &(ka, kb) in edges {
                     let ia = dicts_ref[(mix64(ka) as usize) & 63].lookup_global(ka);
                     let ib = dicts_ref[(mix64(kb) as usize) & 63].lookup_global(kb);
-                    union_min(parent_ref, keys_ref, overflow, ia, ib);
+                    union_min_dense(parent_ref, keys_ref, overflow, ia, ib);
                 }
             }));
         }
@@ -368,7 +795,6 @@ pub fn build_link_redirect(
     drop(thread_edges);
     drop(dicts);
 
-    // Flatten roots in parallel & count non-minimal nodes needing redirection
     let mut roots: Vec<u32> = vec![0u32; num_nodes];
     let redirect_count = AtomicUsize::new(0);
     let flat_threads = num_threads.max(1).min((num_nodes / 1024).max(1));
@@ -409,95 +835,28 @@ pub fn build_link_redirect(
     drop(parent);
 
     let num_redirects = redirect_count.into_inner();
-    if num_redirects == 0 {
-        return LinkRedirect::empty();
-    }
-
-    let slots_cap = (num_redirects * 3 / 2)
-        .max(num_redirects + 64)
-        .next_power_of_two()
-        .max(64);
-    let smask = slots_cap - 1;
-    let atomic_slots: Vec<AtomicRedirectSlot> = (0..slots_cap)
-        .map(|_| AtomicRedirectSlot {
-            key: AtomicU64::new(EMPTY_KEY),
-            val: AtomicU64::new(0),
-        })
-        .collect();
-
-    let num_bits = (num_redirects * 16).next_power_of_two().clamp(4096, 1 << 24);
-    let bmask = num_bits - 1;
-    let atomic_bitset: Vec<AtomicU64> = (0..(num_bits >> 6)).map(|_| AtomicU64::new(0)).collect();
-
-    std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        let mut offset = 0usize;
-        for chunk in roots.chunks(chunk_n) {
-            let start_i = offset;
-            offset += chunk.len();
-            let ak = &all_keys;
-            let asl = &atomic_slots;
-            let abs = &atomic_bitset;
-            handles.push(s.spawn(move || {
-                for (j, &r) in chunk.iter().enumerate() {
-                    let i = start_i + j;
-                    if (r as usize) != i {
-                        let key = ak[i];
-                        let canon = ak[r as usize];
-                        let h = mix64(key);
-                        let bit_idx = (h as usize) & bmask;
-                        abs[bit_idx >> 6].fetch_or(1u64 << (bit_idx & 63), MemOrdering::Relaxed);
-
-                        let mut idx = (h as usize) & smask;
-                        loop {
-                            let s_ref = &asl[idx];
-                            if s_ref
-                                .key
-                                .compare_exchange(
-                                    EMPTY_KEY,
-                                    key,
-                                    MemOrdering::Relaxed,
-                                    MemOrdering::Relaxed,
-                                )
-                                .is_ok()
-                            {
-                                s_ref.val.store(canon, MemOrdering::Relaxed);
-                                break;
-                            }
-                            idx = (idx + 1) & smask;
+    finalize_redirect_from_pairs(num_redirects, |asl, abs, smask, wmask| {
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            let mut offset = 0usize;
+            for chunk in roots.chunks(chunk_n) {
+                let start_i = offset;
+                offset += chunk.len();
+                let ak = &all_keys;
+                handles.push(s.spawn(move || {
+                    for (j, &r) in chunk.iter().enumerate() {
+                        let i = start_i + j;
+                        if (r as usize) != i {
+                            insert_redirect_slot(asl, abs, smask, wmask, ak[i], ak[r as usize]);
                         }
                     }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-    });
-
-    let mut md_slots = ManuallyDrop::new(atomic_slots);
-    let slots = unsafe {
-        Vec::from_raw_parts(
-            md_slots.as_mut_ptr() as *mut RedirectSlot,
-            md_slots.len(),
-            md_slots.capacity(),
-        )
-    };
-    let mut md_bs = ManuallyDrop::new(atomic_bitset);
-    let bitset = unsafe {
-        Vec::from_raw_parts(
-            md_bs.as_mut_ptr() as *mut u64,
-            md_bs.len(),
-            md_bs.capacity(),
-        )
-    };
-
-    LinkRedirect {
-        bitset,
-        bmask,
-        slots,
-        smask,
-    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    })
 }
 
 #[cfg(test)]
@@ -518,11 +877,9 @@ mod tests {
         {
             let mut w1 = File::create(&f1).unwrap();
             writeln!(w1, "user_id_a,user_id_b").unwrap();
-            // 400-node chain in reversed shuffled order -> smallest is "c000"
             for i in (0..399).rev() {
                 writeln!(w1, "c{i:03},c{:03}", i + 1).unwrap();
             }
-            // Self-link + repeated reverse + empty sides (dropped) + malformed (dropped)
             writeln!(w1, "solo,solo").unwrap();
             writeln!(w1, "u1,").unwrap();
             writeln!(w1, ",u2").unwrap();
@@ -533,47 +890,83 @@ mod tests {
         {
             let mut w2 = File::create(&f2).unwrap();
             writeln!(w2, "user_id_a,user_id_b").unwrap();
-            // Star (kiosk) connecting long overflow IDs with a short inline ID "0_hub"
             for i in 0..200 {
                 writeln!(w2, "very_long_kiosk_member_{i:04},kiosk_shared").unwrap();
             }
             writeln!(w2, "kiosk_shared,0_hub").unwrap();
         }
         {
-            // Header-only file
             let mut w3 = File::create(&f3).unwrap();
             writeln!(w3, "user_id_a,user_id_b").unwrap();
         }
 
         let overflow = OverflowInterner::new();
-        let lr = build_link_redirect(&[f1, f2, f3], 4, &overflow);
+        let lr = build_link_redirect(&[f1.clone(), f2.clone(), f3.clone()], 4, &overflow);
 
-        // Chain check
-        let canon_c = overflow.encode(b"c000");
-        for i in 0..400 {
-            let k = overflow.encode(format!("c{i:03}").as_bytes());
-            assert_eq!(lr.resolve(k), canon_c, "chain idx {i}");
+        // Also validate cold fallback produces identical redirects
+        let mmaps: Vec<Mmap> = [f1, f2, f3]
+            .iter()
+            .map(|p| unsafe { MmapOptions::new().map(&File::open(p).unwrap()).unwrap() })
+            .collect();
+        let jobs: Vec<(usize, usize, usize)> = mmaps
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, 0, m.len()))
+            .collect();
+        let lr_fb = build_link_redirect_fallback(&mmaps, &jobs, 4, &overflow);
+
+        for checker in [&lr, &lr_fb] {
+            let canon_c = overflow.encode(b"c000");
+            for i in 0..400 {
+                let k = overflow.encode(format!("c{i:03}").as_bytes());
+                assert_eq!(checker.resolve(k), canon_c, "chain idx {i}");
+            }
+            let solo = overflow.encode(b"solo");
+            assert_eq!(checker.resolve(solo), solo);
+            let u1 = overflow.encode(b"u1");
+            assert_eq!(checker.resolve(u1), u1);
+            assert_eq!(
+                checker.resolve(overflow.encode(b"a2")),
+                overflow.encode(b"a1")
+            );
+            let hub = overflow.encode(b"0_hub");
+            assert_eq!(checker.resolve(overflow.encode(b"kiosk_shared")), hub);
+            for i in 0..200 {
+                let mk = overflow.encode(format!("very_long_kiosk_member_{i:04}").as_bytes());
+                assert_eq!(checker.resolve(mk), hub, "kiosk member {i}");
+            }
         }
 
-        // Self-link should resolve to itself
-        let solo = overflow.encode(b"solo");
-        assert_eq!(lr.resolve(solo), solo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Unlinked IDs resolve to themselves
-        let u1 = overflow.encode(b"u1");
-        assert_eq!(lr.resolve(u1), u1);
-
-        // Repeated pair
-        assert_eq!(lr.resolve(overflow.encode(b"a2")), overflow.encode(b"a1"));
-
-        // Kiosk star mixed overflow + inline canonical smallest
-        let hub = overflow.encode(b"0_hub");
-        assert_eq!(lr.resolve(overflow.encode(b"kiosk_shared")), hub);
-        for i in 0..200 {
-            let mk = overflow.encode(format!("very_long_kiosk_member_{i:04}").as_bytes());
-            assert_eq!(lr.resolve(mk), hub, "kiosk member {i}");
+    #[test]
+    fn link_redirect_dense_triggers_fallback_cleanly() {
+        let dir = std::env::temp_dir().join("shopping_links_dense_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("dense.csv");
+        {
+            let mut w = File::create(&f).unwrap();
+            writeln!(w, "user_id_a,user_id_b").unwrap();
+            // 3200 unique nodes inside ~25 KB => forces overflowed fallback on cap=4096 (max_nodes=3072)
+            for i in 0..1600usize {
+                writeln!(w, "x{i},y{i}").unwrap();
+            }
+            writeln!(w, "x0,00_root").unwrap();
+            writeln!(w, "y0,x1").unwrap();
         }
-
+        let overflow = OverflowInterner::new();
+        let lr = build_link_redirect(&[f], 4, &overflow);
+        let root = overflow.encode(b"00_root");
+        assert_eq!(lr.resolve(overflow.encode(b"x0")), root);
+        assert_eq!(lr.resolve(overflow.encode(b"y0")), root);
+        assert_eq!(lr.resolve(overflow.encode(b"x1")), root);
+        assert_eq!(lr.resolve(overflow.encode(b"y1")), root);
+        assert_eq!(
+            lr.resolve(overflow.encode(b"y1599")),
+            overflow.encode(b"x1599")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

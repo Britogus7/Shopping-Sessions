@@ -8,7 +8,7 @@ use ahash::RandomState;
 use hashbrown::HashTable;
 
 pub const OVERFLOW_BIT: u64 = 1u64 << 63;
-pub const EMPTY_KEY: u64 = u64::MAX;
+pub const EMPTY_KEY: u64 = 0u64;
 
 /// Fast bijective splitmix64 finalizer for hashing 64-bit packed keys and IDs.
 #[inline(always)]
@@ -34,6 +34,9 @@ pub fn pack64_inline(s: &[u8]) -> Option<u64> {
         if ((v | (v.wrapping_sub(0x0101_0101_0101_0101) & !v)) & 0x8080_8080_8080_8080) != 0 {
             return None;
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let mut acc = unsafe { std::arch::x86_64::_pext_u64(v.to_be(), 0x7F7F_7F7F_7F7F_7F7F) } << 7;
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
         let mut acc = unsafe {
             ((*p as u64) << 56)
                 | ((*p.add(1) as u64) << 49)
@@ -69,16 +72,39 @@ pub fn pack64_inline(s: &[u8]) -> Option<u64> {
 /// Unpack an inline `Pack64` key into `out`, returning the byte length (`0..=9`).
 #[inline(always)]
 pub fn unpack64_inline(v: u64, out: &mut [u8; 9]) -> usize {
-    let mut len = 0usize;
-    while len < 9 {
-        let b = ((v >> (56 - 7 * len)) & 0x7F) as u8;
-        if b == 0 {
-            break;
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let hi8 =
+            unsafe { std::arch::x86_64::_pdep_u64(v >> 7, 0x7F7F_7F7F_7F7F_7F7F) }.to_be_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(hi8.as_ptr(), out.as_mut_ptr(), 8);
         }
-        out[len] = b;
-        len += 1;
+        let b8 = (v & 0x7F) as u8;
+        out[8] = b8;
+        if b8 != 0 {
+            return 9;
+        }
+        let hi_le = u64::from_le_bytes(hi8);
+        let zero_mask = hi_le.wrapping_sub(0x0101_0101_0101_0101) & !hi_le & 0x8080_8080_8080_8080;
+        if zero_mask == 0 {
+            8
+        } else {
+            (zero_mask.trailing_zeros() >> 3) as usize
+        }
     }
-    len
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let mut len = 0usize;
+        while len < 9 {
+            let b = ((v >> (56 - 7 * len)) & 0x7F) as u8;
+            if b == 0 {
+                break;
+            }
+            out[len] = b;
+            len += 1;
+        }
+        len
+    }
 }
 
 struct OverflowState {
@@ -230,12 +256,16 @@ mod tests {
             b"",
             b" ",
             b" U1",
+            b"@",
+            b"a@",
             b"U1",
             b"u",
             b"u1",
             b"u1 ",
             b"u10",
             b"u2",
+            b"1234567@",
+            b"12345678@",
             b"u9zzzzzzz",
             b"k\r",
             b"\x7f",
@@ -247,6 +277,9 @@ mod tests {
             .collect();
         for &(k, orig) in &encoded {
             assert_eq!(k & OVERFLOW_BIT, 0);
+            if !orig.is_empty() {
+                assert_ne!(k, EMPTY_KEY);
+            }
             let mut buf = [0u8; 9];
             let len = unpack64_inline(k, &mut buf);
             assert_eq!(&buf[..len], orig);
