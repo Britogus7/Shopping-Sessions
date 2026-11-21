@@ -1,4 +1,4 @@
-//! Direct 2-pass lock-free DSU link resolver (with 3-bit register-blocked Bloom filter
+//! Direct 2-pass lock-free DSU link resolver (with 2-bit register-blocked Bloom filter
 //! and flat open-addressed redirect table) and cold bucketed fallback.
 
 use std::cmp::Ordering;
@@ -85,9 +85,7 @@ pub struct LinkRedirect {
 #[inline(always)]
 fn bloom_word_and_mask(h: u64, wmask: usize) -> (usize, u64) {
     let w = (h as usize) & wmask;
-    let m = (1u64 << ((h >> 24) & 63))
-        | (1u64 << ((h >> 30) & 63))
-        | (1u64 << ((h >> 36) & 63));
+    let m = (1u64 << ((h >> 24) & 63)) | (1u64 << ((h >> 30) & 63));
     (w, m)
 }
 

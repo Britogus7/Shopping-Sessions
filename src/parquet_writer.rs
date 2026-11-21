@@ -561,61 +561,110 @@ fn encode_u16_rle_hybrid(vals: &[u16], bw: u8, out: &mut Vec<u8>) {
     let bw_usize = bw as usize;
     let wb = (bw_usize + 7) >> 3;
     out.reserve(1 + n * wb + (n >> 3) + 64);
-    out.push(bw);
-    let mut i = 0usize;
-    while i < n {
-        let v0 = unsafe { *vals.get_unchecked(i) };
-        let mut r = i + 1;
-        while r < n && unsafe { *vals.get_unchecked(r) } == v0 {
-            r += 1;
-        }
-        let rlen = r - i;
-        if rlen >= 8 {
-            let mut hdr = (rlen as u32) << 1;
-            while hdr >= 0x80 {
-                out.push(((hdr as u8) & 0x7F) | 0x80);
-                hdr >>= 7;
-            }
-            out.push(hdr as u8);
-            let b = (v0 as u32).to_le_bytes();
-            out.extend_from_slice(&b[..wb]);
-            i = r;
-            continue;
-        }
-        let bp_start = i;
-        let mut groups = 0usize;
-        while i < n && groups < 63 {
-            if i + 8 <= n {
-                let vv = unsafe { *vals.get_unchecked(i) };
-                if unsafe {
-                    *vals.get_unchecked(i + 1) == vv
-                        && *vals.get_unchecked(i + 2) == vv
-                        && *vals.get_unchecked(i + 3) == vv
-                        && *vals.get_unchecked(i + 4) == vv
-                        && *vals.get_unchecked(i + 5) == vv
-                        && *vals.get_unchecked(i + 6) == vv
-                        && *vals.get_unchecked(i + 7) == vv
-                } {
-                    break;
+    unsafe {
+        let mut dst = out.as_mut_ptr();
+        *dst = bw;
+        dst = dst.add(1);
+        let src = vals.as_ptr();
+        let mut i = 0usize;
+        while i < n {
+            let v0 = *src.add(i);
+            let mut r = i + 1;
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::*;
+                let vv = _mm_set1_epi16(v0 as i16);
+                while r + 8 <= n {
+                    let blk = _mm_loadu_si128(src.add(r) as *const __m128i);
+                    let m = _mm_movemask_epi8(_mm_cmpeq_epi16(blk, vv));
+                    if m != 0xFFFF {
+                        break;
+                    }
+                    r += 8;
                 }
             }
-            i = (i + 8).min(n);
-            groups += 1;
-        }
-        if groups == 0 {
-            continue;
-        }
-        out.push(((groups << 1) | 1) as u8);
-        let mut pos = bp_start;
-        for _ in 0..groups {
-            let mut bits: u128 = 0;
-            let end = (pos + 8).min(n);
-            for k in 0..(end - pos) {
-                bits |= (unsafe { *vals.get_unchecked(pos + k) } as u128) << (k * bw_usize);
+            while r < n && *src.add(r) == v0 {
+                r += 1;
             }
-            out.extend_from_slice(&bits.to_le_bytes()[..bw_usize]);
-            pos += 8;
+            let rlen = r - i;
+            if rlen >= 8 {
+                let mut hdr = (rlen as u32) << 1;
+                while hdr >= 0x80 {
+                    *dst = ((hdr as u8) & 0x7F) | 0x80;
+                    dst = dst.add(1);
+                    hdr >>= 7;
+                }
+                *dst = hdr as u8;
+                dst = dst.add(1);
+                let b = (v0 as u32).to_le_bytes();
+                std::ptr::copy_nonoverlapping(b.as_ptr(), dst, wb);
+                dst = dst.add(wb);
+                i = r;
+                continue;
+            }
+            let bp_start = i;
+            let mut groups = 0usize;
+            while i < n && groups < 63 {
+                if i + 8 <= n {
+                    let vv0 = *src.add(i);
+                    #[cfg(target_arch = "x86_64")]
+                    let all_eq = {
+                        use std::arch::x86_64::*;
+                        let blk = _mm_loadu_si128(src.add(i) as *const __m128i);
+                        _mm_movemask_epi8(_mm_cmpeq_epi16(blk, _mm_set1_epi16(vv0 as i16))) == 0xFFFF
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let all_eq = *src.add(i + 1) == vv0
+                        && *src.add(i + 2) == vv0
+                        && *src.add(i + 3) == vv0
+                        && *src.add(i + 4) == vv0
+                        && *src.add(i + 5) == vv0
+                        && *src.add(i + 6) == vv0
+                        && *src.add(i + 7) == vv0;
+                    if all_eq {
+                        break;
+                    }
+                }
+                i = (i + 8).min(n);
+                groups += 1;
+            }
+            if groups == 0 {
+                continue;
+            }
+            *dst = ((groups << 1) | 1) as u8;
+            dst = dst.add(1);
+            let mut pos = bp_start;
+            while pos + 8 <= i {
+                let v0 = *src.add(pos) as u128;
+                let v1 = *src.add(pos + 1) as u128;
+                let v2 = *src.add(pos + 2) as u128;
+                let v3 = *src.add(pos + 3) as u128;
+                let v4 = *src.add(pos + 4) as u128;
+                let v5 = *src.add(pos + 5) as u128;
+                let v6 = *src.add(pos + 6) as u128;
+                let v7 = *src.add(pos + 7) as u128;
+                let bits = v0
+                    | (v1 << bw_usize)
+                    | (v2 << (2 * bw_usize))
+                    | (v3 << (3 * bw_usize))
+                    | (v4 << (4 * bw_usize))
+                    | (v5 << (5 * bw_usize))
+                    | (v6 << (6 * bw_usize))
+                    | (v7 << (7 * bw_usize));
+                (dst as *mut u128).write_unaligned(bits.to_le());
+                dst = dst.add(bw_usize);
+                pos += 8;
+            }
+            if pos < i {
+                let mut bits: u128 = 0;
+                for k in 0..(i - pos) {
+                    bits |= (*src.add(pos + k) as u128) << (k * bw_usize);
+                }
+                (dst as *mut u128).write_unaligned(bits.to_le());
+                dst = dst.add(bw_usize);
+            }
         }
+        out.set_len(dst.offset_from(out.as_ptr()) as usize);
     }
 }
 
@@ -861,6 +910,13 @@ impl UserDailyParquetWriter {
             let req_def = ((target + 7) >> 3) + 1;
             if req_def > cur_def {
                 self.def_bits.reserve(req_def - cur_def);
+                unsafe {
+                    std::ptr::write_bytes(
+                        self.def_bits.as_mut_ptr().add(cur_def),
+                        0,
+                        req_def - cur_def,
+                    );
+                }
             }
             self.cap_rows = target;
         }
@@ -906,6 +962,53 @@ impl UserDailyParquetWriter {
     }
 
     #[inline(always)]
+    pub fn push_user_day_zero_rev(
+        &mut self,
+        uid_bytes: &[u8],
+        is_same_user: bool,
+        day: i32,
+        sessions: i32,
+        events: i32,
+    ) {
+        if self.rg_rows >= self.cap_rows || self.dict_uid.len() >= MAX_VAR_BYTES {
+            self.ensure_cap_or_flush();
+        }
+        if is_same_user && !self.uid_runs.is_empty() {
+            *unsafe { self.uid_runs.last_mut().unwrap_unchecked() } += 1;
+        } else {
+            let ulen = uid_bytes.len();
+            let old_len = self.dict_uid.len();
+            if ulen <= 12 && old_len + 16 <= self.dict_uid.capacity() {
+                unsafe {
+                    let dst = self.dict_uid.as_mut_ptr().add(old_len);
+                    (dst as *mut u32).write_unaligned((ulen as u32).to_le());
+                    std::ptr::copy_nonoverlapping(uid_bytes.as_ptr(), dst.add(4), ulen);
+                    self.dict_uid.set_len(old_len + 4 + ulen);
+                }
+            } else {
+                self.dict_uid.extend_from_slice(&(ulen as u32).to_le_bytes());
+                self.dict_uid.extend_from_slice(uid_bytes);
+            }
+            self.uid_runs.push(1);
+        }
+        let idx = self.rg_rows;
+        unsafe {
+            if self.use_day_dict {
+                debug_assert!(
+                    day >= self.min_day && ((day - self.min_day) as usize) < self.day_span
+                );
+                *self.day_ids.as_mut_ptr().add(idx) = (day - self.min_day) as u8;
+            } else {
+                *self.col_day.as_mut_ptr().add(idx) = day;
+            }
+            *self.col_sessions.as_mut_ptr().add(idx) = sessions;
+            *self.col_events.as_mut_ptr().add(idx) = events;
+            *self.rev_ids.as_mut_ptr().add(idx) = 0;
+        }
+        self.rg_rows = idx + 1;
+    }
+
+    #[inline(always)]
     fn push_tail_fields(
         &mut self,
         day: i32,
@@ -934,9 +1037,6 @@ impl UserDailyParquetWriter {
                 *self.rev_ids.as_mut_ptr().add(idx) = rid;
             }
 
-            if (idx & 7) == 0 {
-                *self.def_bits.as_mut_ptr().add(idx >> 3) = 0;
-            }
             if let Some(cid) = top_cat_idx {
                 *self.def_bits.as_mut_ptr().add(idx >> 3) |= 1u8 << (idx & 7);
                 if self.use_cat_dict {
@@ -1002,8 +1102,13 @@ impl UserDailyParquetWriter {
             }
             self.sess_ids.clear();
             self.sess_ids.reserve(nr_usize);
-            for &s in &self.col_sessions {
-                self.sess_ids.push((s - 1) as u8);
+            unsafe {
+                let src = self.col_sessions.as_ptr();
+                let dst = self.sess_ids.as_mut_ptr();
+                for i in 0..nr_usize {
+                    *dst.add(i) = (*src.add(i) - 1) as u8;
+                }
+                self.sess_ids.set_len(nr_usize);
             }
             let bw = if sess_dict_len <= 2 {
                 1u8
@@ -1258,6 +1363,12 @@ impl UserDailyParquetWriter {
         self.dict_rev.clear();
         self.dict_rev.push(0);
         self.def_bits.clear();
+        let zero_bytes = ((self.cap_rows + 7) >> 3) + 1;
+        if self.def_bits.capacity() >= zero_bytes {
+            unsafe {
+                std::ptr::write_bytes(self.def_bits.as_mut_ptr(), 0, zero_bytes);
+            }
+        }
         self.top_cat_ids.clear();
         self.top_cat_vals.clear();
     }
@@ -1544,6 +1655,54 @@ mod tests {
         assert!(wr_s.close());
         let b_sp = std::fs::read(&p_sp).unwrap();
         assert!(b_sp.starts_with(b"PAR1") && b_sp.ends_with(b"PAR1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_daily_zero_rev_and_non_mult8_growth() {
+        let dir = std::env::temp_dir().join("shopping_pq_zero_rev_growth_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cats = vec!["apparel".to_string(), "books".to_string()];
+
+        // Phase 1: est_rows = 4099 (non-multiple of 8), mix push_user_day_zero_rev and push_user_day,
+        // flush_rg() at non-multiples of 8 (505 and 4101) and grow beyond 4099 -> MAX_RG_ROWS
+        let p = dir.join("zrev_growth.parquet");
+        let mut wr = UserDailyParquetWriter::new(p.clone(), &cats, 21_000, 14, 4099);
+        for i in 0..5_000i32 {
+            let uid = format!("zg_{:05}", i / 2);
+            let same = (i & 1) == 1 && i != 506 && i != 4102;
+            if i % 4 == 0 {
+                wr.push_user_day(
+                    uid.as_bytes(),
+                    same,
+                    21_000 + (i % 14),
+                    1 + (i % 5),
+                    2 + (i % 7),
+                    100 + (i as i64),
+                    if (i & 8) == 0 {
+                        Some((i as usize) % cats.len())
+                    } else {
+                        None
+                    },
+                );
+            } else {
+                wr.push_user_day_zero_rev(
+                    uid.as_bytes(),
+                    same,
+                    21_000 + (i % 14),
+                    1 + (i % 5),
+                    2 + (i % 7),
+                );
+            }
+            if i == 505 || i == 4101 {
+                wr.flush_rg();
+            }
+        }
+        assert!(wr.close());
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+        assert!(bytes.len() > 1000);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

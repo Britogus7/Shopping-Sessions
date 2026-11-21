@@ -297,17 +297,15 @@ pub unsafe fn pack_b37_quad_89(
     let digits = _mm256_and_si256(_mm256_sub_epi8(v, sub), valid);
     let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16((1i16 << 8) | 37));
     let quads = _mm256_madd_epi16(pairs, _mm256_set1_epi32((1i32 << 16) | 1369));
-    let lo = _mm256_castsi256_si128(quads);
-    let hi = _mm256_extracti128_si256::<1>(quads);
-    let qa = _mm_cvtsi128_si64(lo) as u64;
-    let qb = _mm_extract_epi64::<1>(lo) as u64;
-    let qc = _mm_cvtsi128_si64(hi) as u64;
-    let qd = _mm_extract_epi64::<1>(hi) as u64;
+    let prod = _mm256_mul_epu32(quads, _mm256_set1_epi64x(1_874_161));
+    let res = _mm256_add_epi64(prod, _mm256_srli_epi64::<32>(quads));
+    let lo = _mm256_castsi256_si128(res);
+    let hi = _mm256_extracti128_si256::<1>(res);
     Some((
-        (qa & 0xFFFF_FFFF) * 1_874_161 + (qa >> 32),
-        (qb & 0xFFFF_FFFF) * 1_874_161 + (qb >> 32),
-        (qc & 0xFFFF_FFFF) * 1_874_161 + (qc >> 32),
-        (qd & 0xFFFF_FFFF) * 1_874_161 + (qd >> 32),
+        _mm_cvtsi128_si64(lo) as u64,
+        _mm_extract_epi64::<1>(lo) as u64,
+        _mm_cvtsi128_si64(hi) as u64,
+        _mm_extract_epi64::<1>(hi) as u64,
     ))
 }
 
@@ -1047,6 +1045,67 @@ mod tests {
                             },
                             None
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[test]
+    fn b37_quad_89_matches_scalar() {
+        let strs_u = [b"u09az09a".as_slice(), b"u09az09az".as_slice()];
+        let strs_e = [b"e0z9a0z9".as_slice(), b"e0z9a0z9a".as_slice()];
+        let strs_k = [b"k12ab34c".as_slice(), b"k12ab34cd".as_slice()];
+        let strs_u2 = [b"uzz00aa9".as_slice(), b"u1nixvyzn".as_slice()];
+
+        for &a in &strs_u {
+            for &b in &strs_e {
+                for &c in &strs_k {
+                    for &d in &strs_u2 {
+                        let exp = (
+                            pack_b37(a, a[0]).unwrap(),
+                            pack_b37(b, b[0]).unwrap(),
+                            pack_b37(c, c[0]).unwrap(),
+                            pack_b37(d, d[0]).unwrap(),
+                        );
+                        let got = unsafe {
+                            pack_b37_quad_89(
+                                a.as_ptr(),
+                                a.len() - 8,
+                                b.as_ptr(),
+                                b.len() - 8,
+                                c.as_ptr(),
+                                c.len() - 8,
+                                d.as_ptr(),
+                                d.len() - 8,
+                            )
+                        };
+                        assert_eq!(got, Some(exp));
+
+                        // Reject any invalid byte in any of the 4 IDs
+                        for lane in 0..4usize {
+                            let src = [a, b, c, d][lane];
+                            for pos in 1..src.len() {
+                                for bad in [b'"', b',', b'\n', b'A', b'Z', b'_', b'{', 0u8, 0xFF] {
+                                    let mut v = [a.to_vec(), b.to_vec(), c.to_vec(), d.to_vec()];
+                                    v[lane][pos] = bad;
+                                    let r = unsafe {
+                                        pack_b37_quad_89(
+                                            v[0].as_ptr(),
+                                            v[0].len() - 8,
+                                            v[1].as_ptr(),
+                                            v[1].len() - 8,
+                                            v[2].as_ptr(),
+                                            v[2].len() - 8,
+                                            v[3].as_ptr(),
+                                            v[3].len() - 8,
+                                        )
+                                    };
+                                    assert_eq!(r, None, "failed reject lane={lane} pos={pos} bad={bad:#x}");
+                                }
+                            }
+                        }
                     }
                 }
             }
