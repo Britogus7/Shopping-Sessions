@@ -1,0 +1,21 @@
+[package]
+name = "shopping-sessions"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+ahash = "0.8"
+arrow-array = "53"
+arrow-schema = "53"
+hashbrown = { version = "0.15", features = ["raw-entry"] }
+memchr = "2.7"
+memmap2 = "0.9"
+parquet = { version = "53", default-features = false, features = ["arrow"] }
+rayon = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
