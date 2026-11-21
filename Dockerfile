@@ -1,4 +1,4 @@
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.89-bookworm AS builder
 
 WORKDIR /src
 ENV RUSTFLAGS="-C target-cpu=x86-64-v3"

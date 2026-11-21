@@ -11,11 +11,12 @@ arrow-schema = "53"
 hashbrown = { version = "0.15", features = ["raw-entry"] }
 memchr = "2.7"
 memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
 parquet = { version = "53", default-features = false, features = ["arrow"] }
-rayon = "1.10"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true
