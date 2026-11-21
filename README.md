@@ -10,7 +10,7 @@ A zero-copy, SIMD-accelerated, sharded parallel Rust implementation with a nativ
 - `memmap2` (0.9) — Memory-mapped read-only CSV input
 - `mimalloc` (0.1) — Contention-free multi-threaded allocator
 
-Using custom lock-free `std::thread` parallelism, AVX-512/AVX2/scalar CSV scanning, a 2-pass lock-free DSU for link resolution, zero-realloc `SlabBuckets`, and a native zero-copy Parquet v1 (`UNCOMPRESSED` + `PLAIN`) writer.
+Using custom lock-free `std::thread` parallelism, AVX-512/AVX2 + `pclmulqdq` fused `CsvRowSink` CSV scanning, `HugeZeroed`/`HugeSlab` transparent-huge-page (`MADV_HUGEPAGE`) memory, non-temporal (`_mm256_stream_si256`) `NtSlabBuckets`, a 2-pass lock-free DSU for link resolution, a 64-entry L1-resident `FastDateCache` + overlapping `u64` SWAR parsers, pre-faulted zero-contention Stage 4 with Condvar-gated `munmap`, and a native zero-copy `write_vectored` Parquet v1 (`UNCOMPRESSED` + `PLAIN`) writer.
 
 ## Build & Run
 

@@ -31,13 +31,17 @@ pub fn pack64_inline(s: &[u8]) -> Option<u64> {
     if len >= 8 {
         let p = s.as_ptr();
         let v = u64::from_le_bytes(unsafe { *(p as *const [u8; 8]) });
-        if ((v | (v.wrapping_sub(0x0101_0101_0101_0101) & !v)) & 0x8080_8080_8080_8080) != 0 {
+        let is9 = len == 9;
+        let b8 = unsafe { *p.add(len - 1) } & 0u8.wrapping_sub(u8::from(is9));
+        let bad_v = (v | (v.wrapping_sub(0x0101_0101_0101_0101) & !v)) & 0x8080_8080_8080_8080;
+        if (bad_v != 0) | (is9 & (b8 == 0)) | (b8 >= 128) {
             return None;
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
-        let mut acc = unsafe { std::arch::x86_64::_pext_u64(v.to_be(), 0x7F7F_7F7F_7F7F_7F7F) } << 7;
+        let acc = (unsafe { std::arch::x86_64::_pext_u64(v.to_be(), 0x7F7F_7F7F_7F7F_7F7F) } << 7)
+            | (b8 as u64);
         #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-        let mut acc = unsafe {
+        let acc = unsafe {
             ((*p as u64) << 56)
                 | ((*p.add(1) as u64) << 49)
                 | ((*p.add(2) as u64) << 42)
@@ -46,14 +50,8 @@ pub fn pack64_inline(s: &[u8]) -> Option<u64> {
                 | ((*p.add(5) as u64) << 21)
                 | ((*p.add(6) as u64) << 14)
                 | ((*p.add(7) as u64) << 7)
+                | (b8 as u64)
         };
-        if len == 9 {
-            let b8 = unsafe { *p.add(8) };
-            if b8 == 0 || b8 >= 128 {
-                return None;
-            }
-            acc |= b8 as u64;
-        }
         return Some(acc);
     }
     let mut acc = 0u64;

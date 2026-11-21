@@ -3,13 +3,13 @@
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as MemOrdering};
 
 use memmap2::{Mmap, MmapOptions};
 
 use crate::csv::scan_csv_mmap_chunk;
+use crate::huge::HugeZeroed;
 use crate::pack::{mix64, OverflowInterner, EMPTY_KEY};
 
 #[repr(C)]
@@ -32,10 +32,12 @@ const _: () = {
     assert!(std::mem::align_of::<AtomicRedirectSlot>() == 8);
 };
 
+const LINK_BLOOM_MAX_SHIFT: u32 = 16; // 1<<16 words = 512 KB
+
 pub struct LinkRedirect {
-    bitset: Vec<u64>,
+    bitset: HugeZeroed<u64>,
     wmask: usize,
-    slots: Vec<RedirectSlot>,
+    slots: HugeZeroed<RedirectSlot>,
     smask: usize,
 }
 
@@ -49,21 +51,24 @@ fn bloom_word_and_mask(h: u64, wmask: usize) -> (usize, u64) {
 }
 
 #[inline(always)]
-fn alloc_zeroed_vec<T>(len: usize) -> Vec<T> {
-    let layout = std::alloc::Layout::array::<T>(len).unwrap();
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if ptr.is_null() {
-        std::alloc::handle_alloc_error(layout);
+fn prefetch_addr<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(
+            ptr as *const i8,
+            std::arch::x86_64::_MM_HINT_T0,
+        );
     }
-    unsafe { Vec::from_raw_parts(ptr as *mut T, len, len) }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ptr;
 }
 
 impl LinkRedirect {
     pub fn empty() -> Self {
         Self {
-            bitset: Vec::new(),
+            bitset: HugeZeroed::new(0),
             wmask: 0,
-            slots: Vec::new(),
+            slots: HugeZeroed::new(0),
             smask: 0,
         }
     }
@@ -74,11 +79,20 @@ impl LinkRedirect {
     }
 
     #[inline(always)]
-    pub fn bloom_hit_slot(&self, k: u64) -> Option<usize> {
+    pub fn prefetch_bloom_for(&self, k: u64) -> u64 {
+        let h = mix64(k);
+        if !self.bitset.is_empty() {
+            let w = (h as usize) & self.wmask;
+            prefetch_addr(unsafe { self.bitset.as_ptr().add(w) });
+        }
+        h
+    }
+
+    #[inline(always)]
+    pub fn bloom_hit_slot_with_hash(&self, h: u64) -> Option<usize> {
         if self.slots.is_empty() {
             return None;
         }
-        let h = mix64(k);
         let (w, m) = bloom_word_and_mask(h, self.wmask);
         let word = unsafe { *self.bitset.get_unchecked(w) };
         if (word & m) != m {
@@ -88,16 +102,20 @@ impl LinkRedirect {
     }
 
     #[inline(always)]
+    pub fn bloom_hit_slot_hash(&self, k: u64) -> (u64, Option<usize>) {
+        let h = mix64(k);
+        (h, self.bloom_hit_slot_with_hash(h))
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn bloom_hit_slot(&self, k: u64) -> Option<usize> {
+        self.bloom_hit_slot_hash(k).1
+    }
+
+    #[inline(always)]
     pub fn prefetch_slot(&self, idx: usize) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch(
-                self.slots.as_ptr().add(idx) as *const i8,
-                std::arch::x86_64::_MM_HINT_T0,
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = idx;
+        prefetch_addr(unsafe { self.slots.as_ptr().add(idx) });
     }
 
     #[inline(always)]
@@ -233,10 +251,7 @@ fn union_min_zero(
     }
 }
 
-fn finalize_redirect_from_pairs<F>(
-    num_redirects: usize,
-    fill: F,
-) -> LinkRedirect
+fn finalize_redirect_from_pairs<F>(num_redirects: usize, fill: F) -> LinkRedirect
 where
     F: FnOnce(&[AtomicRedirectSlot], &[AtomicU64], usize, usize),
 {
@@ -248,49 +263,34 @@ where
         .next_power_of_two()
         .max(64);
     let smask = slots_cap - 1;
-    let atomic_slots: Vec<AtomicRedirectSlot> = alloc_zeroed_vec(slots_cap);
+    let atomic_slots: HugeZeroed<AtomicRedirectSlot> = HugeZeroed::new(slots_cap);
 
-    let num_words = (num_redirects / 4).next_power_of_two().clamp(64, 1 << 18);
+    let num_words = (num_redirects / 4)
+        .next_power_of_two()
+        .clamp(64, 1 << LINK_BLOOM_MAX_SHIFT);
     let wmask = num_words - 1;
-    let atomic_bitset: Vec<AtomicU64> = alloc_zeroed_vec(num_words);
+    let atomic_bitset: HugeZeroed<AtomicU64> = HugeZeroed::new(num_words);
 
     fill(&atomic_slots, &atomic_bitset, smask, wmask);
 
-    let mut md_slots = ManuallyDrop::new(atomic_slots);
-    let slots = unsafe {
-        Vec::from_raw_parts(
-            md_slots.as_mut_ptr() as *mut RedirectSlot,
-            md_slots.len(),
-            md_slots.capacity(),
-        )
-    };
-    let mut md_bs = ManuallyDrop::new(atomic_bitset);
-    let bitset = unsafe {
-        Vec::from_raw_parts(
-            md_bs.as_mut_ptr() as *mut u64,
-            md_bs.len(),
-            md_bs.capacity(),
-        )
-    };
-
     LinkRedirect {
-        bitset,
+        bitset: atomic_bitset.reinterpret::<u64>(),
         wmask,
-        slots,
+        slots: atomic_slots.reinterpret::<RedirectSlot>(),
         smask,
     }
 }
 
 #[inline(always)]
-fn insert_redirect_slot(
+fn insert_redirect_slot_with_hash(
     asl: &[AtomicRedirectSlot],
     abs: &[AtomicU64],
     smask: usize,
     wmask: usize,
     key: u64,
     canon: u64,
+    h: u64,
 ) {
-    let h = mix64(key);
     let (w, m) = bloom_word_and_mask(h, wmask);
     unsafe { abs.get_unchecked(w) }.fetch_or(m, MemOrdering::Relaxed);
 
@@ -306,6 +306,64 @@ fn insert_redirect_slot(
             break;
         }
         idx = (idx + 1) & smask;
+    }
+}
+
+#[inline(always)]
+fn insert_redirect_slot(
+    asl: &[AtomicRedirectSlot],
+    abs: &[AtomicU64],
+    smask: usize,
+    wmask: usize,
+    key: u64,
+    canon: u64,
+) {
+    insert_redirect_slot_with_hash(asl, abs, smask, wmask, key, canon, mix64(key));
+}
+
+#[inline]
+fn flush_edge_batch(
+    batch: &[(u64, u64)],
+    keys_ref: &[AtomicU64],
+    parent_ref: &[AtomicU32],
+    mask: usize,
+    overflow: &OverflowInterner,
+    local_added: &mut usize,
+    global_nodes_ref: &AtomicUsize,
+    max_nodes: usize,
+    overflowed_ref: &AtomicBool,
+) {
+    for &(ka, kb) in batch {
+        prefetch_addr(unsafe { keys_ref.as_ptr().add((mix64(ka) as usize) & mask) });
+        prefetch_addr(unsafe { keys_ref.as_ptr().add((mix64(kb) as usize) & mask) });
+    }
+    for &(ka, kb) in batch {
+        if overflowed_ref.load(MemOrdering::Relaxed) {
+            return;
+        }
+        let Some(ia) = intern_node(
+            keys_ref,
+            mask,
+            ka,
+            local_added,
+            global_nodes_ref,
+            max_nodes,
+            overflowed_ref,
+        ) else {
+            return;
+        };
+        let Some(ib) = intern_node(
+            keys_ref,
+            mask,
+            kb,
+            local_added,
+            global_nodes_ref,
+            max_nodes,
+            overflowed_ref,
+        ) else {
+            return;
+        };
+        union_min_zero(parent_ref, keys_ref, overflow, ia, ib);
     }
 }
 
@@ -327,15 +385,13 @@ pub fn build_link_redirect(
                 return None;
             }
             let m = unsafe { MmapOptions::new().map(&f).ok()? };
-            #[cfg(unix)]
-            let _ = m.advise(memmap2::Advice::Sequential);
             Some(m)
         })
         .collect();
 
     let mut total_link_bytes = 0usize;
     let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
-    const CHUNK_BYTES: usize = 1024 * 1024;
+    const CHUNK_BYTES: usize = 256 * 1024;
     for (fidx, m) in mmaps.iter().enumerate() {
         let len = m.len();
         total_link_bytes += len;
@@ -356,22 +412,22 @@ pub fn build_link_redirect(
     let mask = cap - 1;
     let max_nodes = (cap * 3) / 4;
 
-    let keys: Vec<AtomicU64> = alloc_zeroed_vec(cap);
-    let parent: Vec<AtomicU32> = alloc_zeroed_vec(cap);
+    let keys: HugeZeroed<AtomicU64> = HugeZeroed::new(cap);
+    let parent: HugeZeroed<AtomicU32> = HugeZeroed::new(cap);
     let global_nodes = AtomicUsize::new(0);
     let overflowed = AtomicBool::new(false);
     let has_edges = AtomicBool::new(false);
     let next_job = AtomicUsize::new(0);
 
-    // Pass 1: Read CSV chunks and execute lock-free DSU directly inside flat hash table
+    // Pass 1: Read CSV chunks and execute batched-prefetch lock-free DSU directly inside flat hash table
     std::thread::scope(|s| {
         let read_nt = nt.min(jobs.len());
         let mut handles = Vec::with_capacity(read_nt);
         let mmaps_ref = &mmaps;
         let jobs_ref = &jobs;
         let next_job_ref = &next_job;
-        let keys_ref = &keys;
-        let parent_ref = &parent;
+        let keys_ref: &[AtomicU64] = &keys;
+        let parent_ref: &[AtomicU32] = &parent;
         let global_nodes_ref = &global_nodes;
         let overflowed_ref = &overflowed;
         let has_edges_ref = &has_edges;
@@ -380,6 +436,8 @@ pub fn build_link_redirect(
             handles.push(s.spawn(move || {
                 let mut local_added = 0usize;
                 let mut local_edges = false;
+                let mut edge_batch = [(0u64, 0u64); 32];
+                let mut batch_len = 0usize;
                 loop {
                     if overflowed_ref.load(MemOrdering::Relaxed) {
                         break;
@@ -397,32 +455,39 @@ pub fn build_link_redirect(
                             let kb = overflow.encode(b);
                             if ka != kb {
                                 local_edges = true;
-                                let Some(ia) = intern_node(
-                                    keys_ref,
-                                    mask,
-                                    ka,
-                                    &mut local_added,
-                                    global_nodes_ref,
-                                    max_nodes,
-                                    overflowed_ref,
-                                ) else {
-                                    return;
-                                };
-                                let Some(ib) = intern_node(
-                                    keys_ref,
-                                    mask,
-                                    kb,
-                                    &mut local_added,
-                                    global_nodes_ref,
-                                    max_nodes,
-                                    overflowed_ref,
-                                ) else {
-                                    return;
-                                };
-                                union_min_zero(parent_ref, keys_ref, overflow, ia, ib);
+                                edge_batch[batch_len] = (ka, kb);
+                                batch_len += 1;
+                                if batch_len == 32 {
+                                    flush_edge_batch(
+                                        &edge_batch,
+                                        keys_ref,
+                                        parent_ref,
+                                        mask,
+                                        overflow,
+                                        &mut local_added,
+                                        global_nodes_ref,
+                                        max_nodes,
+                                        overflowed_ref,
+                                    );
+                                    batch_len = 0;
+                                }
                             }
                         }
                     });
+                    if batch_len > 0 && !overflowed_ref.load(MemOrdering::Relaxed) {
+                        flush_edge_batch(
+                            &edge_batch[..batch_len],
+                            keys_ref,
+                            parent_ref,
+                            mask,
+                            overflow,
+                            &mut local_added,
+                            global_nodes_ref,
+                            max_nodes,
+                            overflowed_ref,
+                        );
+                    }
+                    batch_len = 0;
                 }
                 if local_edges {
                     has_edges_ref.store(true, MemOrdering::Relaxed);
@@ -460,7 +525,7 @@ pub fn build_link_redirect(
                 break;
             }
             let end = (start + chunk_n).min(cap);
-            let p_ref = &parent;
+            let p_ref: &[AtomicU32] = &parent;
             let rc_ref = &redirect_count;
             handles.push(s.spawn(move || {
                 let mut local_redir = 0usize;
@@ -492,7 +557,7 @@ pub fn build_link_redirect(
 
     let num_redirects = redirect_count.into_inner();
     let res = finalize_redirect_from_pairs(num_redirects, |asl, abs, smask, wmask| {
-        // Pass 2b: Scatter (key -> canonical_min_key) into LinkRedirect in parallel
+        // Pass 2b: Batched-prefetch scatter (key -> canonical_min_key) into LinkRedirect in parallel
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(nt);
             for t in 0..nt {
@@ -501,16 +566,41 @@ pub fn build_link_redirect(
                     break;
                 }
                 let end = (start + chunk_n).min(cap);
-                let p_ref = &parent;
-                let k_ref = &keys;
+                let p_ref: &[AtomicU32] = &parent;
+                let k_ref: &[AtomicU64] = &keys;
                 handles.push(s.spawn(move || {
+                    let mut batch = [(0u64, 0usize, 0u64); 32];
+                    let mut blen = 0usize;
                     for i in start..end {
                         let p_raw = unsafe { p_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
                         if p_raw != 0 {
                             let key = unsafe { k_ref.get_unchecked(i) }.load(MemOrdering::Relaxed);
-                            let canon = unsafe { k_ref.get_unchecked((p_raw - 1) as usize) }
-                                .load(MemOrdering::Relaxed);
-                            insert_redirect_slot(asl, abs, smask, wmask, key, canon);
+                            let h = mix64(key);
+                            let root_idx = (p_raw - 1) as usize;
+                            prefetch_addr(unsafe { k_ref.as_ptr().add(root_idx) });
+                            prefetch_addr(unsafe { abs.as_ptr().add((h as usize) & wmask) });
+                            prefetch_addr(unsafe {
+                                asl.as_ptr().add(((h >> 20) as usize) & smask)
+                            });
+                            batch[blen] = (key, root_idx, h);
+                            blen += 1;
+                            if blen == 32 {
+                                for &(k, ridx, kh) in &batch {
+                                    let canon = unsafe { k_ref.get_unchecked(ridx) }
+                                        .load(MemOrdering::Relaxed);
+                                    insert_redirect_slot_with_hash(
+                                        asl, abs, smask, wmask, k, canon, kh,
+                                    );
+                                }
+                                blen = 0;
+                            }
+                        }
+                    }
+                    if blen > 0 {
+                        for &(k, ridx, kh) in &batch[..blen] {
+                            let canon =
+                                unsafe { k_ref.get_unchecked(ridx) }.load(MemOrdering::Relaxed);
+                            insert_redirect_slot_with_hash(asl, abs, smask, wmask, k, canon, kh);
                         }
                     }
                 }));

@@ -1,4 +1,5 @@
 mod csv;
+mod huge;
 mod links;
 mod pack;
 mod parquet_writer;

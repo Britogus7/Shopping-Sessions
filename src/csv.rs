@@ -1,11 +1,5 @@
-//! Spec-exact SIMD CSV scanner, pread chunk reader, L1 window date table,
+//! Spec-exact SIMD CSV scanner, L1 window date table,
 //! and SWAR timestamp / price parsers.
-
-use std::fs::File;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(not(unix))]
-use std::io::{Read, Seek, SeekFrom};
 
 pub const DAY_MS: i64 = 86_400_000;
 pub const SESSION_GAP_MS: i64 = 1_800_000;
@@ -104,101 +98,6 @@ where
 }
 
 #[inline(always)]
-fn scan_csv_block_inner<'a, const N: usize, F>(
-    slice: &'a [u8],
-    blk_pos: usize,
-    nl_m: u64,
-    cm_m: u64,
-    qt_m: u64,
-    fields: &mut [&'a [u8]; N],
-    line_start: &mut usize,
-    field_idx: &mut usize,
-    field_start: &mut usize,
-    field_quotes: &mut u32,
-    bad_line: &mut bool,
-    f: &mut F,
-) where
-    F: FnMut(&[&'a [u8]; N]),
-{
-    let mut delim_m = nl_m | cm_m;
-    if qt_m == 0 && *field_quotes == 0 && !*bad_line {
-        while delim_m != 0 {
-            let bit = delim_m.trailing_zeros();
-            let dpos = blk_pos + bit as usize;
-            let fs = *field_start;
-            if ((cm_m >> bit) & 1) != 0 {
-                if *field_idx < N - 1 {
-                    fields[*field_idx] = unsafe { slice.get_unchecked(fs..dpos) };
-                    *field_idx += 1;
-                } else {
-                    *bad_line = true;
-                }
-                *field_start = dpos + 1;
-            } else {
-                if !*bad_line && *field_idx == N - 1 && dpos > *line_start {
-                    fields[N - 1] = unsafe { slice.get_unchecked(fs..dpos) };
-                    f(fields);
-                }
-                *line_start = dpos + 1;
-                *field_idx = 0;
-                *field_start = dpos + 1;
-                *bad_line = false;
-            }
-            delim_m &= delim_m - 1;
-        }
-        return;
-    }
-
-    let mut rem_qt = qt_m;
-    let ptr = slice.as_ptr();
-
-    while delim_m != 0 {
-        let bit = delim_m.trailing_zeros();
-        let dpos = blk_pos + bit as usize;
-        let is_comma = ((cm_m >> bit) & 1) != 0;
-
-        let q_mask = rem_qt & ((1u64 << bit) - 1);
-        rem_qt ^= q_mask;
-        let q = *field_quotes + q_mask.count_ones();
-        *field_quotes = 0;
-
-        let fs = *field_start;
-        let dlen = dpos - fs;
-        let is_q2 = (q == 2) & (dlen >= 2);
-        let adj = is_q2 as usize;
-        let b_first = unsafe { *ptr.add(fs) };
-        let b_last = unsafe { *ptr.add(dpos.saturating_sub(1)) };
-        let ok_q = (q == 0) | (is_q2 & (b_first == b'"') & (b_last == b'"'));
-        *bad_line |= !ok_q;
-
-        if is_comma {
-            if *field_idx < N - 1 {
-                fields[*field_idx] = unsafe { slice.get_unchecked(fs + adj..dpos - adj) };
-                *field_idx += 1;
-            } else {
-                *bad_line = true;
-            }
-            *field_start = dpos + 1;
-        } else {
-            if !*bad_line && *field_idx == N - 1 && dpos > *line_start {
-                fields[N - 1] = unsafe { slice.get_unchecked(fs + adj..dpos - adj) };
-                f(fields);
-            }
-            *line_start = dpos + 1;
-            *field_idx = 0;
-            *field_start = dpos + 1;
-            *bad_line = false;
-        }
-
-        delim_m &= delim_m - 1;
-    }
-
-    if !*bad_line {
-        *field_quotes += rem_qt.count_ones();
-    }
-}
-
-#[inline(always)]
 fn scalar_block_masks(blk: &[u8]) -> (u64, u64, u64) {
     let mut nl_m = 0u64;
     let mut cm_m = 0u64;
@@ -216,160 +115,284 @@ fn scalar_block_masks(blk: &[u8]) -> (u64, u64, u64) {
     (nl_m, cm_m, qt_m)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn scan_csv_slice_avx512<const N: usize, F: FnMut(&[&[u8]; N])>(
+/// Zero-copy row sink for batched SIMD CSV scanning.
+pub trait CsvRowSink<const N: usize> {
+    /// Safety: `rpos` points to `N` valid delimiter offsets (`u16`) within `ptr`,
+    /// `s0 <= *rpos`, and Micro-Pass 1 guaranteed all quotes in the row are validly paired.
+    unsafe fn on_pos(&mut self, ptr: *const u8, s0: usize, rpos: *const u16);
+    fn on_row(&mut self, row: &[&[u8]; N]);
+}
+
+#[inline(always)]
+fn prefix_xor_scalar(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+#[inline(always)]
+unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
     slice: &[u8],
-    f: &mut F,
+    sink: &mut S,
+    mut load_blk64: M,
+    mut prefix_xor: PX,
+) where
+    M: FnMut(*const u8) -> (u64, u64, u64),
+    PX: FnMut(u64) -> u64,
+{
+    const {
+        assert!(N >= 2);
+    }
+    let len = slice.len();
+    let mut off = 0usize;
+    let mut pos_buf = [0u16; 4104];
+
+    while off < len {
+        let rem_all = len - off;
+        let blk = if rem_all <= 4096 {
+            let Some(nl_rel) = memchr::memrchr(b'\n', &slice[off..]) else {
+                break;
+            };
+            let b = &slice[off..=off + nl_rel];
+            off += nl_rel + 1;
+            b
+        } else if let Some(nl_rel) = memchr::memrchr(b'\n', &slice[off..off + 4096]) {
+            let b = &slice[off..=off + nl_rel];
+            off += nl_rel + 1;
+            b
+        } else if let Some(nl_rel) = memchr::memchr(b'\n', &slice[off + 4096..]) {
+            let line = &slice[off..off + 4096 + nl_rel];
+            if let Some(row) = parse_csv_line::<N>(line) {
+                sink.on_row(&row);
+            }
+            off += 4096 + nl_rel + 1;
+            continue;
+        } else {
+            break;
+        };
+
+        let blen = blk.len();
+        let ptr = blk.as_ptr();
+        let mut pos = 0usize;
+        let mut prev_ended_delim = 1u64;
+        let mut prev_in_q = 0u64;
+        let mut bad = 0u64;
+        let mut n_delims = 0usize;
+        let mut expected_nl = N - 1;
+
+        while pos < blen {
+            let rem = blen - pos;
+            let step = rem.min(64);
+            let (nl_m, cm_m, qt_m) = if rem >= 64 {
+                load_blk64(ptr.add(pos))
+            } else {
+                scalar_block_masks(&blk[pos..])
+            };
+
+            let delim = nl_m | cm_m;
+            let next_is_delim: u64 = if pos + step < blen {
+                let nb = *ptr.add(pos + step);
+                u64::from(nb == b',' || nb == b'\n')
+            } else {
+                1
+            };
+            let open = (delim << 1) | prev_ended_delim;
+            let close = (delim >> 1) | (if step == 64 { next_is_delim << 63 } else { 0 });
+            let in_q = prefix_xor(qt_m) ^ prev_in_q;
+            bad |= (qt_m & !(open | close)) | (qt_m & open & close) | (in_q & delim);
+            prev_ended_delim = delim >> 63;
+            prev_in_q = 0u64.wrapping_sub(in_q >> 63);
+
+            let old_n = n_delims;
+            let cnt = delim.count_ones() as usize;
+            let mut dst = pos_buf.as_mut_ptr().add(old_n);
+            let p16 = pos as u16;
+            let mut d = delim;
+            while d != 0 {
+                *dst = p16.wrapping_add(d.trailing_zeros() as u16);
+                d &= d - 1;
+                *dst.add(1) = p16.wrapping_add(d.trailing_zeros() as u16);
+                d &= d - 1;
+                *dst.add(2) = p16.wrapping_add(d.trailing_zeros() as u16);
+                d &= d - 1;
+                *dst.add(3) = p16.wrapping_add(d.trailing_zeros() as u16);
+                d &= d - 1;
+                dst = dst.add(4);
+            }
+            n_delims = old_n + cnt;
+
+            let mut nm = nl_m;
+            while nm != 0 {
+                let b = nm.trailing_zeros();
+                let nl_idx = old_n + (delim & ((1u64 << b) - 1)).count_ones() as usize;
+                bad |= (nl_idx ^ expected_nl) as u64;
+                expected_nl += N;
+                nm &= nm - 1;
+            }
+            pos += step;
+        }
+
+        if bad != 0 || prev_in_q != 0 || n_delims != expected_nl + 1 - N {
+            for_each_data_line(blk, false, |line| {
+                if let Some(row) = parse_csv_line::<N>(line) {
+                    sink.on_row(&row);
+                }
+            });
+            continue;
+        }
+
+        let mut k = 0usize;
+        let mut s = 0usize;
+        let pbase = pos_buf.as_ptr();
+        while k < n_delims {
+            let rp = pbase.add(k);
+            sink.on_pos(ptr, s, rp);
+            s = (*rp.add(N - 1) as usize) + 1;
+            k += N;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,pclmulqdq")]
+unsafe fn scan_csv_slice_avx512_sink<const N: usize, S: CsvRowSink<N>>(
+    slice: &[u8],
+    sink: &mut S,
 ) {
     use std::arch::x86_64::*;
 
     let v_nl = _mm512_set1_epi8(b'\n' as i8);
     let v_cm = _mm512_set1_epi8(b',' as i8);
     let v_qt = _mm512_set1_epi8(b'"' as i8);
+    let all_ones = _mm_set1_epi8(-1);
 
-    let mut fields = [&[][..]; N];
-    let mut line_start = 0usize;
-    let mut field_idx = 0usize;
-    let mut field_start = 0usize;
-    let mut field_quotes = 0u32;
-    let mut bad_line = false;
-
-    let len = slice.len();
-    let mut pos = 0usize;
-    let ptr = slice.as_ptr();
-    while pos + 64 <= len {
-        let blk = _mm512_loadu_si512(ptr.add(pos) as *const _);
-        let nl_m = _mm512_cmpeq_epi8_mask(blk, v_nl);
-        let cm_m = _mm512_cmpeq_epi8_mask(blk, v_cm);
-        let qt_m = _mm512_cmpeq_epi8_mask(blk, v_qt);
-        scan_csv_block_inner::<N, F>(
-            slice,
-            pos,
-            nl_m,
-            cm_m,
-            qt_m,
-            &mut fields,
-            &mut line_start,
-            &mut field_idx,
-            &mut field_start,
-            &mut field_quotes,
-            &mut bad_line,
-            f,
-        );
-        pos += 64;
-    }
-    if pos < len {
-        let (nl_m, cm_m, qt_m) = scalar_block_masks(&slice[pos..]);
-        scan_csv_block_inner::<N, F>(
-            slice,
-            pos,
-            nl_m,
-            cm_m,
-            qt_m,
-            &mut fields,
-            &mut line_start,
-            &mut field_idx,
-            &mut field_start,
-            &mut field_quotes,
-            &mut bad_line,
-            f,
-        );
-    }
+    scan_csv_slice_batched_sink::<N, _, _, S>(
+        slice,
+        sink,
+        |p| {
+            let blk = _mm512_loadu_si512(p as *const _);
+            (
+                _mm512_cmpeq_epi8_mask(blk, v_nl),
+                _mm512_cmpeq_epi8_mask(blk, v_cm),
+                _mm512_cmpeq_epi8_mask(blk, v_qt),
+            )
+        },
+        |q| _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q as i64), all_ones, 0)) as u64,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn scan_csv_slice_avx2<const N: usize, F: FnMut(&[&[u8]; N])>(slice: &[u8], f: &mut F) {
+#[target_feature(enable = "avx2,pclmulqdq")]
+unsafe fn scan_csv_slice_avx2_sink<const N: usize, S: CsvRowSink<N>>(
+    slice: &[u8],
+    sink: &mut S,
+) {
     use std::arch::x86_64::*;
 
     let v_nl = _mm256_set1_epi8(b'\n' as i8);
     let v_cm = _mm256_set1_epi8(b',' as i8);
     let v_qt = _mm256_set1_epi8(b'"' as i8);
+    let all_ones = _mm_set1_epi8(-1);
 
-    let mut fields = [&[][..]; N];
-    let mut line_start = 0usize;
-    let mut field_idx = 0usize;
-    let mut field_start = 0usize;
-    let mut field_quotes = 0u32;
-    let mut bad_line = false;
+    scan_csv_slice_batched_sink::<N, _, _, S>(
+        slice,
+        sink,
+        |p| {
+            let lo = _mm256_loadu_si256(p as *const __m256i);
+            let hi = _mm256_loadu_si256(p.add(32) as *const __m256i);
 
-    let len = slice.len();
-    let mut pos = 0usize;
-    let ptr = slice.as_ptr();
-    while pos + 64 <= len {
-        let lo = _mm256_loadu_si256(ptr.add(pos) as *const __m256i);
-        let hi = _mm256_loadu_si256(ptr.add(pos + 32) as *const __m256i);
+            let nl_lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v_nl)) as u32 as u64;
+            let nl_hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v_nl)) as u32 as u64;
+            let cm_lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v_cm)) as u32 as u64;
+            let cm_hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v_cm)) as u32 as u64;
+            let qt_lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v_qt)) as u32 as u64;
+            let qt_hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v_qt)) as u32 as u64;
 
-        let nl_lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v_nl)) as u32 as u64;
-        let nl_hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v_nl)) as u32 as u64;
-        let cm_lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v_cm)) as u32 as u64;
-        let cm_hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v_cm)) as u32 as u64;
-        let qt_lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, v_qt)) as u32 as u64;
-        let qt_hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, v_qt)) as u32 as u64;
+            (nl_lo | (nl_hi << 32), cm_lo | (cm_hi << 32), qt_lo | (qt_hi << 32))
+        },
+        |q| _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q as i64), all_ones, 0)) as u64,
+    );
+}
 
-        scan_csv_block_inner::<N, F>(
-            slice,
-            pos,
-            nl_lo | (nl_hi << 32),
-            cm_lo | (cm_hi << 32),
-            qt_lo | (qt_hi << 32),
-            &mut fields,
-            &mut line_start,
-            &mut field_idx,
-            &mut field_start,
-            &mut field_quotes,
-            &mut bad_line,
-            f,
-        );
-        pos += 64;
+#[inline]
+pub fn scan_csv_slice_sink<const N: usize, S: CsvRowSink<N>>(slice: &[u8], sink: &mut S) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("pclmulqdq")
+        {
+            unsafe { scan_csv_slice_avx512_sink::<N, S>(slice, sink) };
+            return;
+        }
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("pclmulqdq")
+        {
+            unsafe { scan_csv_slice_avx2_sink::<N, S>(slice, sink) };
+            return;
+        }
     }
-    if pos < len {
-        let (nl_m, cm_m, qt_m) = scalar_block_masks(&slice[pos..]);
-        scan_csv_block_inner::<N, F>(
+    unsafe {
+        scan_csv_slice_batched_sink::<N, _, _, S>(
             slice,
-            pos,
-            nl_m,
-            cm_m,
-            qt_m,
-            &mut fields,
-            &mut line_start,
-            &mut field_idx,
-            &mut field_start,
-            &mut field_quotes,
-            &mut bad_line,
-            f,
+            sink,
+            |p| scalar_block_masks(std::slice::from_raw_parts(p, 64)),
+            prefix_xor_scalar,
         );
     }
 }
 
-fn scan_csv_slice_scalar<const N: usize, F: FnMut(&[&[u8]; N])>(slice: &[u8], f: &mut F) {
-    let mut fields = [&[][..]; N];
-    let mut line_start = 0usize;
-    let mut field_idx = 0usize;
-    let mut field_start = 0usize;
-    let mut field_quotes = 0u32;
-    let mut bad_line = false;
-
-    let mut pos = 0usize;
-    while pos < slice.len() {
-        let end = (pos + 64).min(slice.len());
-        let (nl_m, cm_m, qt_m) = scalar_block_masks(&slice[pos..end]);
-        scan_csv_block_inner::<N, F>(
-            slice,
-            pos,
-            nl_m,
-            cm_m,
-            qt_m,
-            &mut fields,
-            &mut line_start,
-            &mut field_idx,
-            &mut field_start,
-            &mut field_quotes,
-            &mut bad_line,
-            f,
-        );
-        pos = end;
+/// Scan every valid CSV data line owned by byte range `[start, end)` in a memory-mapped file slice,
+/// dispatching valid rows directly through `CsvRowSink<N>` without intermediate slice arrays.
+#[inline]
+pub fn scan_csv_mmap_chunk_sink<const N: usize, S: CsvRowSink<N>>(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    sink: &mut S,
+) {
+    if start >= end || start >= data.len() {
+        return;
+    }
+    let end = end.min(data.len());
+    let start_pos = if start == 0 {
+        let Some(nl) = memchr::memchr(b'\n', data) else {
+            return;
+        };
+        nl + 1
+    } else {
+        let Some(rel) = memchr::memchr(b'\n', &data[start - 1..]) else {
+            return;
+        };
+        start + rel
+    };
+    if start_pos >= end {
+        return;
+    }
+    if let Some(rel) = memchr::memchr(b'\n', &data[end - 1..]) {
+        let stop = (end - 1) + rel;
+        scan_csv_slice_sink::<N, S>(&data[start_pos..=stop], sink);
+    } else if let Some(last_nl) = memchr::memrchr(b'\n', &data[start_pos..]) {
+        let nl_abs = start_pos + last_nl;
+        scan_csv_slice_sink::<N, S>(&data[start_pos..=nl_abs], sink);
+        let tail = &data[nl_abs + 1..];
+        if !tail.is_empty() {
+            if let Some(row) = parse_csv_line::<N>(tail) {
+                sink.on_row(&row);
+            }
+        }
+    } else {
+        let tail = &data[start_pos..];
+        if !tail.is_empty() {
+            if let Some(row) = parse_csv_line::<N>(tail) {
+                sink.on_row(&row);
+            }
+        }
     }
 }
 
@@ -425,187 +448,27 @@ pub fn scan_csv_mmap_chunk<const N: usize, F: FnMut(&[&[u8]; N])>(
 /// Scan every `\n`-terminated CSV line in `slice` using AVX-512 / AVX2 (64B/iter) or scalar dispatch.
 #[inline]
 pub fn scan_csv_slice<const N: usize, F: FnMut(&[&[u8]; N])>(slice: &[u8], f: &mut F) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-        {
-            unsafe { scan_csv_slice_avx512::<N, F>(slice, f) };
-            return;
-        }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            unsafe { scan_csv_slice_avx2::<N, F>(slice, f) };
-            return;
-        }
-    }
-    scan_csv_slice_scalar::<N, F>(slice, f);
-}
-
-#[cfg(unix)]
-#[allow(dead_code)]
-#[inline]
-fn read_exact_or_eof(file: &File, mut offset: u64, dst: &mut [u8]) -> (usize, bool) {
-    let mut filled = 0usize;
-    while filled < dst.len() {
-        match file.read_at(&mut dst[filled..], offset) {
-            Ok(0) => return (filled, true),
-            Ok(n) => {
-                filled += n;
-                offset += n as u64;
+    struct FnSink<'a, F>(&'a mut F);
+    impl<const N: usize, F: FnMut(&[&[u8]; N])> CsvRowSink<N> for FnSink<'_, F> {
+        #[inline(always)]
+        unsafe fn on_pos(&mut self, ptr: *const u8, mut s: usize, rpos: *const u16) {
+            let mut fields = [&[][..]; N];
+            for i in 0..N {
+                let e = *rpos.add(i) as usize;
+                let q = usize::from(*ptr.add(s) == b'"');
+                *fields.get_unchecked_mut(i) =
+                    std::slice::from_raw_parts(ptr.add(s + q), (e - s) - (q << 1));
+                s = e + 1;
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => panic!("read_at failed: {e}"),
+            (self.0)(&fields);
+        }
+        #[inline(always)]
+        fn on_row(&mut self, row: &[&[u8]; N]) {
+            (self.0)(row);
         }
     }
-    (filled, false)
-}
-
-#[cfg(not(unix))]
-#[inline]
-fn read_exact_or_eof(file: &File, offset: u64, dst: &mut [u8]) -> (usize, bool) {
-    let mut f = file;
-    f.seek(SeekFrom::Start(offset)).expect("seek");
-    let mut filled = 0usize;
-    while filled < dst.len() {
-        match f.read(&mut dst[filled..]) {
-            Ok(0) => return (filled, true),
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => panic!("read failed: {e}"),
-        }
-    }
-    (filled, false)
-}
-
-const READ_BLOCK: usize = 512 * 1024;
-
-/// Read and parse every valid CSV data line owned by file byte range `[start, end)`
-/// (starting at offset `L` with `start <= L < end`, skipping line 0 header).
-/// Zero upfront newline pre-scanning and zero per-chunk buffer re-zeroing.
-#[allow(dead_code)]
-pub fn read_csv_chunk<const N: usize, F: FnMut(&[&[u8]; N])>(
-    file: &File,
-    start: u64,
-    end: u64,
-    buf: &mut Vec<u8>,
-    mut f: F,
-) {
-    if start >= end {
-        return;
-    }
-    const MIN_BUF: usize = 2 * 1024 * 1024 + 128 * 1024;
-    if buf.len() < MIN_BUF {
-        buf.resize(MIN_BUF, 0);
-    }
-
-    let mut valid_len = 0usize;
-    let mut buf_file_off = if start == 0 { 0 } else { start - 1 };
-    let mut hit_eof = false;
-
-    // Step 1: read up to (end - buf_file_off + 64KB) in one shot to avoid second pread on normal lines.
-    let first_nl = loop {
-        if valid_len == buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
-        let remain_chunk = end.saturating_sub(buf_file_off + valid_len as u64) as usize;
-        let desired = (remain_chunk + 65_536).max(65_536);
-        let to_read = desired.min(buf.len() - valid_len);
-        let prev = valid_len;
-        let (n, eof) =
-            read_exact_or_eof(file, buf_file_off + prev as u64, &mut buf[prev..prev + to_read]);
-        valid_len += n;
-        if eof {
-            hit_eof = true;
-        }
-        if let Some(rel) = memchr::memchr(b'\n', &buf[prev..valid_len]) {
-            break Some(prev + rel);
-        }
-        if eof {
-            break None;
-        }
-    };
-
-    let Some(nl_idx) = first_nl else {
-        return;
-    };
-
-    let data_start_off = buf_file_off + (nl_idx as u64) + 1;
-    if data_start_off >= end {
-        return;
-    }
-
-    let rem = valid_len - (nl_idx + 1);
-    buf.copy_within(nl_idx + 1..valid_len, 0);
-    valid_len = rem;
-    buf_file_off = data_start_off;
-
-    // Step 2: stream complete owned lines from buf_file_off .. < end.
-    loop {
-        if buf_file_off >= end {
-            break;
-        }
-        let end_in_buf = end - buf_file_off;
-
-        if (valid_len as u64) >= end_in_buf {
-            let rel_end = end_in_buf as usize;
-            if let Some(rel) = memchr::memchr(b'\n', &buf[rel_end - 1..valid_len]) {
-                let stop = rel_end - 1 + rel;
-                scan_csv_slice::<N, F>(&buf[..=stop], &mut f);
-                break;
-            } else if hit_eof {
-                let data = &buf[..valid_len];
-                if let Some(last_nl) = memchr::memrchr(b'\n', data) {
-                    scan_csv_slice::<N, F>(&data[..=last_nl], &mut f);
-                    let tail = &data[last_nl + 1..];
-                    if !tail.is_empty() {
-                        if let Some(row) = parse_csv_line::<N>(tail) {
-                            f(&row);
-                        }
-                    }
-                } else if !data.is_empty() {
-                    if let Some(row) = parse_csv_line::<N>(data) {
-                        f(&row);
-                    }
-                }
-                break;
-            }
-        } else if valid_len > 0 {
-            let data = &buf[..valid_len];
-            if let Some(last_nl) = memchr::memrchr(b'\n', data) {
-                scan_csv_slice::<N, F>(&data[..=last_nl], &mut f);
-                let tail_len = valid_len - (last_nl + 1);
-                buf.copy_within(last_nl + 1..valid_len, 0);
-                valid_len = tail_len;
-                buf_file_off += (last_nl + 1) as u64;
-                if buf_file_off >= end {
-                    break;
-                }
-            }
-            if hit_eof {
-                if valid_len > 0 {
-                    if let Some(row) = parse_csv_line::<N>(&buf[..valid_len]) {
-                        f(&row);
-                    }
-                }
-                break;
-            }
-        } else if hit_eof {
-            break;
-        }
-
-        if valid_len == buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
-        let to_read = (buf.len() - valid_len).min(READ_BLOCK);
-        let prev = valid_len;
-        let (n, eof) =
-            read_exact_or_eof(file, buf_file_off + prev as u64, &mut buf[prev..prev + to_read]);
-        valid_len += n;
-        if eof {
-            hit_eof = true;
-        }
-    }
+    let mut sink = FnSink(f);
+    scan_csv_slice_sink::<N, _>(slice, &mut sink);
 }
 
 #[inline(always)]
@@ -676,54 +539,77 @@ fn max_day_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
-/// Compact L1-resident 16-slot month cache indexed branchlessly by `((m0*10 + m1) & 15)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DayCacheEntry {
+    ym: u64,
+    ddt: u32,
+    rel_sec: i32,
+}
+
+#[inline(always)]
+fn day_cache_slot(ym: u64, ddt: u32) -> usize {
+    let day_bucket = (((ddt & 3) * 10 + ((ddt >> 8) & 15)) & 31) as usize;
+    let m_parity = (((ym >> 48) & 1) << 5) as usize;
+    day_bucket | m_parity
+}
+
+/// Compact L1-resident 64-entry day cache (`1 KB`) for branchless ISO date resolution.
 pub struct FastDateCache {
     pub win_start_ms: i64,
     pub win_start_sec: i64,
     pub win_start_whole_sec: bool,
-    ym_u64: [u64; 16],
-    base_rel_sec: [i64; 16],
-    max_day: [u8; 16],
+    entries: [DayCacheEntry; 64],
 }
 
 impl FastDateCache {
     pub fn new(win_start_ms: i64, win_end_ms: i64) -> Self {
         let win_start_sec = win_start_ms.div_euclid(1_000);
         let win_start_whole_sec = win_start_ms.rem_euclid(1_000) == 0;
-        let (mut y, mut m, _) = civil_from_days((win_start_ms - 8 * DAY_MS).div_euclid(DAY_MS));
-        let (end_y, end_m, _) = civil_from_days((win_end_ms + 7 * DAY_MS).div_euclid(DAY_MS));
+        let start_day = (win_start_ms - 8 * DAY_MS).div_euclid(DAY_MS);
+        let end_day = (win_end_ms + 7 * DAY_MS).div_euclid(DAY_MS);
 
-        let mut ym_u64 = [0u64; 16];
-        let mut base_rel_sec = [0i64; 16];
-        let mut max_day = [0u8; 16];
+        let mut entries = [DayCacheEntry {
+            ym: 0,
+            ddt: 0,
+            rel_sec: 0,
+        }; 64];
         let mut filled = 0usize;
-
-        while (y < end_y || (y == end_y && m <= end_m)) && filled < 12 {
+        let mut d = start_day;
+        while d <= end_day && filled < 60 {
+            let (y, m, dom) = civil_from_days(d);
             if (0..=9999).contains(&y) {
-                let slot = m as usize;
-                if ym_u64[slot] == 0 {
-                    let s = format!("{y:04}-{m:02}-");
-                    ym_u64[slot] = u64::from_le_bytes(s.as_bytes().try_into().unwrap());
-                    max_day[slot] = max_day_in_month(y, m) as u8;
-                    base_rel_sec[slot] = (days_from_civil(y, m, 1) - 1) * 86_400 - win_start_sec;
+                let ym_str = format!("{y:04}-{m:02}-");
+                let ym = u64::from_le_bytes(ym_str.as_bytes().try_into().unwrap());
+                let ddt = u32::from_le_bytes([
+                    b'0' + (dom / 10) as u8,
+                    b'0' + (dom % 10) as u8,
+                    b'T',
+                    0,
+                ]);
+                let rel_sec_i64 = d * 86_400 - win_start_sec;
+                if rel_sec_i64 >= (i32::MIN as i64 + 100_000)
+                    && rel_sec_i64 <= (i32::MAX as i64 - 100_000)
+                {
+                    let slot = day_cache_slot(ym, ddt);
+                    if entries[slot].ym == 0 {
+                        entries[slot] = DayCacheEntry {
+                            ym,
+                            ddt,
+                            rel_sec: rel_sec_i64 as i32,
+                        };
+                        filled += 1;
+                    }
                 }
-                filled += 1;
             }
-            if m == 12 {
-                y += 1;
-                m = 1;
-            } else {
-                m += 1;
-            }
+            d += 1;
         }
 
         Self {
             win_start_ms,
             win_start_sec,
             win_start_whole_sec,
-            ym_u64,
-            base_rel_sec,
-            max_day,
+            entries,
         }
     }
 }
@@ -758,49 +644,63 @@ fn parse_iso_datetime_cold_rel_sec(b: &[u8], win_start_sec: i64) -> Option<i64> 
 }
 
 #[inline(always)]
-fn parse_iso_body_rel_sec(b: &[u8], cache: &FastDateCache) -> Option<i64> {
-    let p = b.as_ptr();
-    let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
-    let w1 = unsafe { (p.add(8) as *const u64).read_unaligned() }.to_le();
-    let w2 = unsafe { (p.add(16) as *const u32).read_unaligned() }.to_le();
-
-    if (((w1 & 0x0000_FF00_00FF_0000) ^ 0x0000_3A00_0054_0000)
-        | (((w2 & 0xFF) ^ (b':' as u32)) as u64))
+fn parse_hms_swar(w_hms: u64) -> Option<i64> {
+    let d = w_hms.wrapping_sub(0x3030_3A30_303A_3030);
+    if ((d & 0x0000_FF00_00FF_0000)
+        | ((d.wrapping_add(0x7676_0076_7600_7676) | d) & 0x8080_0080_8000_8080))
         != 0
     {
         return None;
     }
-
-    let dig8 = (w1 & 0xFFFF_00FF_FF00_FFFF)
-        | (((w2 & 0x0000_FF00) as u64) << 8)
-        | (((w2 & 0x00FF_0000) as u64) << 24);
-    let d = dig8.wrapping_sub(0x3030_3030_3030_3030);
-    if ((d.wrapping_add(0x7676_7676_7676_7676) | d) & 0x8080_8080_8080_8080) != 0 {
+    let pairs = (d & 0x00FF_0000_FF00_00FF) * 10 + ((d >> 8) & 0x00FF_0000_FF00_00FF);
+    if (pairs.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080) != 0 {
         return None;
     }
+    Some(((pairs & 0xFF) * 3_600 + ((pairs >> 24) & 0xFF) * 60 + (pairs >> 48)) as i64)
+}
 
-    let dd = ((d & 0xFF) * 10 + ((d >> 8) & 0xFF)) as i64;
-    let ss = (((d >> 16) & 0xFF) * 10 + ((d >> 40) & 0xFF)) as i64;
-    let hh = (((d >> 24) & 0xFF) * 10 + ((d >> 32) & 0xFF)) as i64;
-    let mm = (((d >> 48) & 0xFF) * 10 + ((d >> 56) & 0xFF)) as i64;
-    if (hh > 23) | (mm > 59) | (ss > 59) | (dd == 0) {
-        return None;
-    }
+#[inline(always)]
+fn parse_iso_body_rel_sec(b: &[u8], cache: &FastDateCache) -> Option<i64> {
+    let p = b.as_ptr();
+    let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+    let ddt = unsafe { (p.add(8) as *const u32).read_unaligned() }.to_le() & 0x00FF_FFFF;
+    let w_hms = unsafe { (p.add(11) as *const u64).read_unaligned() }.to_le();
 
-    let time_sec = hh * 3_600 + mm * 60 + ss;
-    let m0 = ((w0 >> 40) as u8).wrapping_sub(b'0');
-    let m1 = ((w0 >> 48) as u8).wrapping_sub(b'0');
-    let slot = (m0.wrapping_mul(10).wrapping_add(m1) as usize) & 15;
-    if w0 == unsafe { *cache.ym_u64.get_unchecked(slot) } {
-        if dd > unsafe { *cache.max_day.get_unchecked(slot) } as i64 {
-            return None;
-        }
-        return Some(unsafe { *cache.base_rel_sec.get_unchecked(slot) } + dd * 86_400 + time_sec);
+    let time_sec = parse_hms_swar(w_hms)?;
+    let slot = day_cache_slot(w0, ddt);
+    let entry = unsafe { *cache.entries.get_unchecked(slot) };
+    if w0 == entry.ym && ddt == entry.ddt {
+        return Some(entry.rel_sec as i64 + time_sec);
     }
 
     parse_iso_datetime_cold_rel_sec(b, cache.win_start_sec)
 }
 
+#[inline(always)]
+fn parse_iso_body_rel_sec_with_hint(
+    b: &[u8],
+    cache: &FastDateCache,
+    hint: &IngestHint,
+) -> Option<i64> {
+    let p = b.as_ptr();
+    let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+    let ddt = unsafe { (p.add(8) as *const u32).read_unaligned() }.to_le() & 0x00FF_FFFF;
+    let w_hms = unsafe { (p.add(11) as *const u64).read_unaligned() }.to_le();
+
+    let time_sec = parse_hms_swar(w_hms)?;
+    if ((w0 ^ hint.ym) | ((ddt ^ hint.ddt) as u64)) == 0 {
+        return Some(hint.day_rel_sec + time_sec);
+    }
+    let slot = day_cache_slot(w0, ddt);
+    let entry = unsafe { *cache.entries.get_unchecked(slot) };
+    if w0 == entry.ym && ddt == entry.ddt {
+        return Some(entry.rel_sec as i64 + time_sec);
+    }
+
+    parse_iso_datetime_cold_rel_sec(b, cache.win_start_sec)
+}
+
+#[cfg(test)]
 #[inline(always)]
 pub fn parse_8_digits_swar(chunk: [u8; 8]) -> Option<u64> {
     let v = u64::from_le_bytes(chunk);
@@ -815,68 +715,190 @@ pub fn parse_8_digits_swar(chunk: [u8; 8]) -> Option<u64> {
     Some(x)
 }
 
-#[inline(always)]
-pub fn parse_4_digits_swar(chunk: [u8; 4]) -> Option<u64> {
-    let v = u32::from_le_bytes(chunk);
-    let d = v.wrapping_sub(0x3030_3030);
-    if ((d.wrapping_add(0x7676_7676) | d) & 0x8080_8080) != 0 {
-        return None;
+#[derive(Clone, Copy)]
+pub struct IngestHint {
+    pub ym: u64,
+    pub ddt: u32,
+    pub day_rel_sec: i64,
+}
+
+impl Default for IngestHint {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            ym: 0,
+            ddt: u32::MAX, // real ddt is masked to 0x00FF_FFFF, so this sentinel never matches
+            day_rel_sec: 0,
+        }
     }
-    let mut x = d;
-    x = (x * 10 + (x >> 8)) & 0x00FF_00FF;
-    x = (x * 100 + (x >> 16)) & 0x0000_FFFF;
-    Some(x as u64)
 }
 
 #[cold]
-fn parse_ingest_cold(b: &[u8]) -> Option<(i64, bool)> {
-    parse_ts(b).map(|ms| (ms, false))
+fn parse_ingest_cold_with_hint(b: &[u8]) -> Option<(i64, bool, IngestHint)> {
+    parse_ts(b).map(|ms| (ms, false, IngestHint::default()))
 }
 
-/// Fast `ingest_ts` parser returning `(val, is_rel_sec)`.
-/// When `is_rel_sec == true`, `val = (ingest_ts - win_start_ms) / 1000` directly (zero division).
+#[inline(always)]
+fn resolve_iso_day_rel_sec(
+    w0: u64,
+    ddt: u32,
+    cache: &FastDateCache,
+) -> Option<(i64, u64, u32)> {
+    let slot = day_cache_slot(w0, ddt);
+    let entry = unsafe { *cache.entries.get_unchecked(slot) };
+    if w0 == entry.ym && ddt == entry.ddt {
+        return Some((entry.rel_sec as i64, w0, ddt));
+    }
+    None
+}
+
+#[inline(always)]
+pub fn parse_ingest_fast_sec(b: &[u8], cache: &FastDateCache) -> Option<(i32, IngestHint)> {
+    if b.len() == 20 && b[19] == b'Z' && cache.win_start_whole_sec {
+        let p = b.as_ptr();
+        let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+        let ddt = unsafe { (p.add(8) as *const u32).read_unaligned() }.to_le() & 0x00FF_FFFF;
+        let w_hms = unsafe { (p.add(11) as *const u64).read_unaligned() }.to_le();
+        let time_sec = parse_hms_swar(w_hms)?;
+        if let Some((day_rel_sec, ym, c_ddt)) = resolve_iso_day_rel_sec(w0, ddt, cache) {
+            return Some((
+                (day_rel_sec + time_sec) as i32,
+                IngestHint {
+                    ym,
+                    ddt: c_ddt,
+                    day_rel_sec,
+                },
+            ));
+        }
+    }
+    None
+}
+
+/// Fast `ingest_ts` parser returning `(val, is_rel_sec, same_date_hint)`.
+/// When `is_rel_sec == true`, `val = (ingest_ts - win_start_ms) / 1000` directly.
+#[inline(always)]
+pub fn parse_ingest_with_hint(b: &[u8], cache: &FastDateCache) -> Option<(i64, bool, IngestHint)> {
+    if b.len() == 20 && b[19] == b'Z' && cache.win_start_whole_sec {
+        let p = b.as_ptr();
+        let w0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+        let ddt = unsafe { (p.add(8) as *const u32).read_unaligned() }.to_le() & 0x00FF_FFFF;
+        let w_hms = unsafe { (p.add(11) as *const u64).read_unaligned() }.to_le();
+        let time_sec = parse_hms_swar(w_hms)?;
+        if let Some((day_rel_sec, ym, c_ddt)) = resolve_iso_day_rel_sec(w0, ddt, cache) {
+            return Some((
+                day_rel_sec + time_sec,
+                true,
+                IngestHint {
+                    ym,
+                    ddt: c_ddt,
+                    day_rel_sec,
+                },
+            ));
+        }
+        return parse_iso_datetime_cold_rel_sec(b, cache.win_start_sec)
+            .map(|s| (s, true, IngestHint::default()));
+    }
+    parse_ingest_cold_with_hint(b)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 pub fn parse_ingest_rel_sec(b: &[u8], cache: &FastDateCache) -> Option<(i64, bool)> {
-    if b.len() == 20 && b[19] == b'Z' && cache.win_start_whole_sec {
-        return parse_iso_body_rel_sec(b, cache).map(|s| (s, true));
-    }
-    parse_ingest_cold(b)
+    parse_ingest_with_hint(b, cache).map(|(v, r, _)| (v, r))
 }
 
-/// Fast timestamp parser returning `ts_ms - win_start_ms`.
+#[inline(always)]
+fn swar8_from_digits(mut x: u64) -> u64 {
+    x = (x * 10 + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
+    x = (x * 100 + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (x * 10_000 + (x >> 32)) & 0x0000_0000_FFFF_FFFF
+}
+
+#[inline(always)]
+fn parse_f3_13(b: &[u8], cache: &FastDateCache) -> Option<i64> {
+    let p = b.as_ptr();
+    let v0 = unsafe { (p as *const u64).read_unaligned() }.to_le();
+    let v1 = unsafe { (p.add(5) as *const u64).read_unaligned() }.to_le();
+    let d0 = v0.wrapping_sub(0x3030_3030_3030_3030);
+    let d1 = v1.wrapping_sub(0x3030_3030_3030_3030);
+    let bad = ((d0.wrapping_add(0x7676_7676_7676_7676) | d0)
+        | (d1.wrapping_add(0x7676_7676_7676_7676) | d1))
+        & 0x8080_8080_8080_8080;
+    if bad != 0 {
+        return None;
+    }
+    let hi5 = swar8_from_digits(d0 << 24);
+    let lo8 = swar8_from_digits(d1);
+    let ms = (hi5 * 100_000_000 + lo8) as i64;
+    Some(ms - cache.win_start_ms)
+}
+
+/// Fast timestamp parser returning `ts_ms - win_start_ms` with zero-lookup same-date fast path.
+#[inline(always)]
+pub fn parse_ts_rel_ms_with_hint(
+    b: &[u8],
+    cache: &FastDateCache,
+    hint: &IngestHint,
+) -> Option<i64> {
+    let len = b.len();
+    if len == 13 {
+        return parse_f3_13(b, cache);
+    }
+    if len >= 20 {
+        if len == 20 && b[19] == b'Z' {
+            if cache.win_start_whole_sec {
+                return parse_iso_body_rel_sec_with_hint(b, cache, hint).map(|s| s * 1_000);
+            }
+            return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
+        }
+        if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+            let oh = d2(b[20], b[21])?;
+            let om = d2(b[23], b[24])?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off_sec = oh * 3_600 + om * 60;
+            let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
+            if cache.win_start_whole_sec {
+                let utc_sec = parse_iso_body_rel_sec_with_hint(b, cache, hint)?;
+                return Some(utc_sec * 1_000 + off_ms);
+            }
+            let utc_ms = parse_iso_datetime(b)?;
+            return Some(utc_ms + off_ms - cache.win_start_ms);
+        }
+    }
+    parse_ts_f3_general(b).map(|ms| ms - cache.win_start_ms)
+}
+
+/// Fast timestamp parser returning `ts_ms - win_start_ms` (without hint, e.g. clicks).
 #[inline(always)]
 pub fn parse_ts_rel_ms(b: &[u8], cache: &FastDateCache) -> Option<i64> {
     let len = b.len();
-    if len == 20 && b[19] == b'Z' {
-        if cache.win_start_whole_sec {
-            return parse_iso_body_rel_sec(b, cache).map(|s| s * 1_000);
-        }
-        return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
-    }
     if len == 13 {
-        let hi = parse_8_digits_swar(unsafe { *(b.as_ptr() as *const [u8; 8]) })?;
-        let mid = parse_4_digits_swar(unsafe { *(b.as_ptr().add(8) as *const [u8; 4]) })?;
-        let d12 = b[12].wrapping_sub(b'0');
-        if d12 > 9 {
-            return None;
-        }
-        let ms = (hi * 100_000 + mid * 10 + d12 as u64) as i64;
-        return Some(ms - cache.win_start_ms);
+        return parse_f3_13(b, cache);
     }
-    if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
-        let oh = d2(b[20], b[21])?;
-        let om = d2(b[23], b[24])?;
-        if oh > 23 || om > 59 {
-            return None;
+    if len >= 20 {
+        if len == 20 && b[19] == b'Z' {
+            if cache.win_start_whole_sec {
+                return parse_iso_body_rel_sec(b, cache).map(|s| s * 1_000);
+            }
+            return parse_iso_datetime(b).map(|ms| ms - cache.win_start_ms);
         }
-        let off_sec = oh * 3_600 + om * 60;
-        let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
-        if cache.win_start_whole_sec {
-            let utc_sec = parse_iso_body_rel_sec(b, cache)?;
-            return Some(utc_sec * 1_000 + off_ms);
+        if len == 25 && (b[19] == b'+' || b[19] == b'-') && b[22] == b':' {
+            let oh = d2(b[20], b[21])?;
+            let om = d2(b[23], b[24])?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off_sec = oh * 3_600 + om * 60;
+            let off_ms = if b[19] == b'+' { -off_sec } else { off_sec } * 1_000;
+            if cache.win_start_whole_sec {
+                let utc_sec = parse_iso_body_rel_sec(b, cache)?;
+                return Some(utc_sec * 1_000 + off_ms);
+            }
+            let utc_ms = parse_iso_datetime(b)?;
+            return Some(utc_ms + off_ms - cache.win_start_ms);
         }
-        let utc_ms = parse_iso_datetime(b)?;
-        return Some(utc_ms + off_ms - cache.win_start_ms);
     }
     parse_ts_f3_general(b).map(|ms| ms - cache.win_start_ms)
 }
@@ -962,7 +984,6 @@ pub fn parse_price_cents(b: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn swar_digit_verification_exhaustive_single_byte() {
@@ -1071,31 +1092,11 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir();
-        let path = dir.join("shopping_csv_chunk_test.csv");
-        {
-            let mut f = File::create(&path).unwrap();
-            f.write_all(bytes).unwrap();
-        }
-        let f = File::open(&path).unwrap();
-        let total = bytes.len() as u64;
-        for chunk_sz in [1u64, 2, 3, 5, 17, 63, 64, 65, 256, 4096] {
-            let mut got: Vec<[Vec<u8>; 3]> = Vec::new();
-            let mut buf = Vec::new();
-            let mut s = 0u64;
-            while s < total {
-                let e = (s + chunk_sz).min(total);
-                read_csv_chunk::<3, _>(&f, s, e, &mut buf, |&[a, b, c]| {
-                    got.push([a.to_vec(), b.to_vec(), c.to_vec()]);
-                });
-                s = e;
-            }
-            assert_eq!(got, expected, "read_csv_chunk chunk_sz={chunk_sz}");
-
+        for chunk_sz in [1usize, 2, 3, 5, 17, 63, 64, 65, 256, 4096] {
             let mut got_mmap: Vec<[Vec<u8>; 3]> = Vec::new();
             let mut s2 = 0usize;
             while s2 < bytes.len() {
-                let e2 = (s2 + chunk_sz as usize).min(bytes.len());
+                let e2 = (s2 + chunk_sz).min(bytes.len());
                 scan_csv_mmap_chunk::<3, _>(bytes, s2, e2, |&[a, b, c]| {
                     got_mmap.push([a.to_vec(), b.to_vec(), c.to_vec()]);
                 });
@@ -1103,6 +1104,186 @@ mod tests {
             }
             assert_eq!(got_mmap, expected, "scan_csv_mmap_chunk chunk_sz={chunk_sz}");
         }
-        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn swar_hms_exhaustive() {
+        for hh in 0u64..=99 {
+            for mm in 0u64..=99 {
+                for ss in 0u64..=99 {
+                    let s = format!("{hh:02}:{mm:02}:{ss:02}");
+                    let w_hms = u64::from_le_bytes(s.as_bytes().try_into().unwrap());
+                    let got = parse_hms_swar(w_hms);
+                    let expected = if hh <= 23 && mm <= 59 && ss <= 59 {
+                        Some((hh * 3_600 + mm * 60 + ss) as i64)
+                    } else {
+                        None
+                    };
+                    assert_eq!(got, expected, "hms={s}");
+                }
+            }
+        }
+        // Check wrong separators and bad byte at every position
+        for pos in 0..8usize {
+            for b in [b'/', b';', b' ', b'T', b'0' - 1, b':', b'a', 0u8, 0xFF] {
+                let mut raw = *b"12:34:56";
+                raw[pos] = b;
+                let expected = if (pos == 2 || pos == 5) && b == b':' {
+                    Some(12 * 3_600 + 34 * 60 + 56)
+                } else if pos != 2 && pos != 5 && b.is_ascii_digit() {
+                    let d = (b - b'0') as i64;
+                    let mut arr = [1, 2, 0, 3, 4, 0, 5, 6];
+                    arr[pos] = d;
+                    let hh = arr[0] * 10 + arr[1];
+                    let mm = arr[3] * 10 + arr[4];
+                    let ss = arr[6] * 10 + arr[7];
+                    if hh <= 23 && mm <= 59 && ss <= 59 {
+                        Some(hh * 3_600 + mm * 60 + ss)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                assert_eq!(
+                    parse_hms_swar(u64::from_le_bytes(raw)),
+                    expected,
+                    "pos={pos} b={b:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn simd_scanner_lengths_and_quote_edges() {
+        let mut content = String::from("h1,h2,h3\n");
+        let variants = [
+            "\"\"",
+            "\"",
+            "\"a",
+            "a\"",
+            "\"a\"b\"",
+            "\"\"\"",
+            "\"\"a",
+            "x\r",
+            "\"ok\"",
+            "",
+            "abc",
+        ];
+        // Sweep line lengths from 60..=135 (explicitly exercising 63, 64, 65, 126, 127, 128, 129)
+        for target_len in 60..=135usize {
+            let core_a = "u".repeat((target_len - 10) / 2);
+            let core_b = "v".repeat(target_len - 10 - (target_len - 10) / 2);
+            content.push_str(&format!("{core_a},\"{core_b}\",p1234\n"));
+            content.push_str(&format!("\"{core_a}\",{core_b},p5678\n"));
+        }
+        // Sweep quote variants in every column with padding before/after crossing 64B & 128B boundaries
+        for pad in [0usize, 1, 15, 29, 30, 31, 61, 62, 63] {
+            let pfx = "p".repeat(pad);
+            for v in variants {
+                content.push_str(&format!("{v},{pfx},end\n"));
+                content.push_str(&format!("{pfx},{v},end\n"));
+                content.push_str(&format!("{pfx},mid,{v}\n"));
+            }
+        }
+        content.push_str("\"tail_a\",tail_b,\"\"");
+
+        let bytes = content.as_bytes();
+        let mut expected: Vec<[Vec<u8>; 3]> = Vec::new();
+        for_each_data_line(bytes, true, |l| {
+            if let Some([a, b, c]) = parse_csv_line::<3>(l) {
+                expected.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+            }
+        });
+        assert!(!expected.is_empty());
+
+        // Direct slice scan (newline-terminated prefix)
+        let last_nl = memchr::memrchr(b'\n', bytes).unwrap();
+        let hdr_nl = memchr::memchr(b'\n', bytes).unwrap();
+        let mut expected_nl: Vec<[Vec<u8>; 3]> = Vec::new();
+        for_each_data_line(&bytes[..=last_nl], true, |l| {
+            if let Some([a, b, c]) = parse_csv_line::<3>(l) {
+                expected_nl.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+            }
+        });
+        let mut got_slice: Vec<[Vec<u8>; 3]> = Vec::new();
+        scan_csv_slice::<3, _>(&bytes[hdr_nl + 1..=last_nl], &mut |&[a, b, c]| {
+            got_slice.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+        });
+        assert_eq!(got_slice, expected_nl, "direct scan_csv_slice");
+
+        for chunk_sz in [1usize, 2, 3, 5, 17, 63, 64, 65, 256, 4096] {
+            let mut got_mmap: Vec<[Vec<u8>; 3]> = Vec::new();
+            let mut s2 = 0usize;
+            while s2 < bytes.len() {
+                let e2 = (s2 + chunk_sz).min(bytes.len());
+                scan_csv_mmap_chunk::<3, _>(bytes, s2, e2, |&[a, b, c]| {
+                    got_mmap.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+                });
+                s2 = e2;
+            }
+            assert_eq!(got_mmap, expected, "mmap edge chunk_sz={chunk_sz}");
+        }
+    }
+
+    #[test]
+    fn parse_f3_13_exhaustive_single_byte() {
+        let ws = parse_ts(b"2028-02-20T00:00:00Z").unwrap();
+        let we = parse_ts(b"2028-03-05T00:00:00Z").unwrap();
+        let cache = FastDateCache::new(ws, we);
+        let base = *b"1835481600123";
+        for pos in 0..13usize {
+            let mut buf = base;
+            for b in 0u8..=255 {
+                buf[pos] = b;
+                assert_eq!(
+                    parse_ts_rel_ms(&buf, &cache),
+                    parse_ts(&buf).map(|ms| ms - ws),
+                    "pos={pos} b={b:#x}"
+                );
+            }
+        }
+        assert_eq!(
+            parse_ts_rel_ms(b"9999999999999", &cache),
+            parse_ts(b"9999999999999").map(|ms| ms - ws)
+        );
+        assert_eq!(
+            parse_ts_rel_ms(b"0000000000000", &cache),
+            parse_ts(b"0000000000000").map(|ms| ms - ws)
+        );
+    }
+
+    #[test]
+    fn batched_scanner_multi_4k_blocks_and_long_lines() {
+        let mut content = String::from("a,b,c\n");
+        let long_field = "L".repeat(4500);
+        for i in 0..160usize {
+            match i % 9 {
+                0 => content.push_str(&format!("\"u_{i}\",mid,\"p_{i}\"\n")),
+                1 => content.push_str(&format!("u_{i},\"bad\"q,p_{i}\n")),
+                2 => content.push_str(&format!("\"\",\n")),
+                3 => content.push_str(&format!("a,b,c,d\n")),
+                4 => content.push_str(&format!("\",u_{i},p_{i}\n")),
+                5 => content.push_str("\n"),
+                6 => content.push_str(&format!("\"u_{i}\",\"v_{i}\",\"\"\n")),
+                7 if i == 70 => content.push_str(&format!("{long_field},\"ok\",end\n")),
+                8 if i == 80 => content.push_str(&format!("{long_field},\"bad\"q,end\n")),
+                _ => content.push_str(&format!("u_{i},v_{i},p_{i}\n")),
+            }
+        }
+        content.push_str("\"end_a\",end_b,\"end_c\"\n");
+        let bytes = content.as_bytes();
+        let mut expected: Vec<[Vec<u8>; 3]> = Vec::new();
+        for_each_data_line(bytes, true, |l| {
+            if let Some([a, b, c]) = parse_csv_line::<3>(l) {
+                expected.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+            }
+        });
+
+        let mut got_mmap = Vec::new();
+        scan_csv_mmap_chunk::<3, _>(bytes, 0, bytes.len(), |&[a, b, c]| {
+            got_mmap.push([a.to_vec(), b.to_vec(), c.to_vec()]);
+        });
+        assert_eq!(got_mmap, expected, "multi-4k mmap");
     }
 }

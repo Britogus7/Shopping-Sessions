@@ -1,7 +1,7 @@
 //! Minimal, zero-copy Parquet v1 UNCOMPRESSED + PLAIN writer using Thrift Compact Protocol.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IoSlice, Write};
 use std::path::{Path, PathBuf};
 
 const _: () = assert!(cfg!(target_endian = "little"));
@@ -225,8 +225,8 @@ struct RowGroupRecord {
     num_rows: i64,
 }
 
-fn encode_data_page_header(num_values: i32, payload_size: i32, out: &mut ThriftBuf) {
-    out.0.clear();
+fn append_data_page_header(num_values: i32, payload_size: i32, out: &mut ThriftBuf) -> (usize, usize) {
+    let start = out.0.len();
     let mut last = 0i16;
     out.write_field_i32(&mut last, 1, PAGE_DATA_PAGE);
     out.write_field_i32(&mut last, 2, payload_size);
@@ -239,6 +239,23 @@ fn encode_data_page_header(num_values: i32, payload_size: i32, out: &mut ThriftB
     out.write_field_i32(&mut dlast, 4, ENC_RLE);
     out.write_struct_end();
     out.write_struct_end();
+    (start, out.0.len())
+}
+
+fn encode_data_page_header(num_values: i32, payload_size: i32, out: &mut ThriftBuf) {
+    out.0.clear();
+    let _ = append_data_page_header(num_values, payload_size, out);
+}
+
+fn write_all_iovec(f: &mut File, mut bufs: &mut [IoSlice<'_>]) {
+    while !bufs.is_empty() {
+        match f.write_vectored(bufs) {
+            Ok(0) => panic!("write_vectored returned 0"),
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => panic!("write_vectored failed: {e}"),
+        }
+    }
 }
 
 fn encode_file_metadata(schema_cols: &[ColSpec], total_rows: i64, rgs: &[RowGroupRecord]) -> Vec<u8> {
@@ -385,14 +402,16 @@ const MAX_VAR_BYTES: usize = 128 * 1024 * 1024;
 
 pub struct UserDailyParquetWriter {
     path: PathBuf,
-    writer: Option<BufWriter<File>>,
+    file: Option<File>,
     file_pos: i64,
     total_rows: i64,
     rgs: Vec<RowGroupRecord>,
     hdr_buf: ThriftBuf,
     encoded_cats: Vec<Vec<u8>>,
+    init_cap_rows: usize,
 
     rg_rows: usize,
+    cap_rows: usize,
     col_uid: Vec<u8>,
     col_day: Vec<i32>,
     col_sessions: Vec<i32>,
@@ -404,7 +423,7 @@ pub struct UserDailyParquetWriter {
 }
 
 impl UserDailyParquetWriter {
-    pub fn new(path: PathBuf, categories: &[String]) -> Self {
+    pub fn new(path: PathBuf, categories: &[String], est_rows: usize) -> Self {
         let mut encoded_cats = Vec::with_capacity(categories.len());
         for c in categories {
             let b = c.as_bytes();
@@ -415,13 +434,15 @@ impl UserDailyParquetWriter {
         }
         Self {
             path,
-            writer: None,
+            file: None,
             file_pos: 0,
             total_rows: 0,
             rgs: Vec::new(),
             hdr_buf: ThriftBuf::new(),
             encoded_cats,
+            init_cap_rows: est_rows.clamp(4_096, MAX_RG_ROWS),
             rg_rows: 0,
+            cap_rows: 0,
             col_uid: Vec::new(),
             col_day: Vec::new(),
             col_sessions: Vec::new(),
@@ -433,18 +454,81 @@ impl UserDailyParquetWriter {
         }
     }
 
-    #[cold]
-    fn reserve_initial(&mut self) {
-        self.col_uid.reserve(4 * 1024 * 1024);
-        self.col_day.reserve(300_000);
-        self.col_sessions.reserve(300_000);
-        self.col_events.reserve(300_000);
-        self.col_rev.reserve(300_000);
-        self.def_bits.reserve(40_000);
-        self.top_cat_vals.reserve(512 * 1024);
+    /// Pre-allocate and pre-fault initial row-group column buffers before Stage 4 begins,
+    /// avoiding page-fault lock contention while background `munmap` runs.
+    pub fn prefault(&mut self) {
+        self.ensure_cap_or_flush();
+        self.rle_buf.reserve(((self.cap_rows + 7) >> 3) + 1024);
+        #[inline(always)]
+        unsafe fn touch_uninit_cap<T>(v: &mut Vec<T>) {
+            debug_assert_eq!(v.len(), 0);
+            let bytes = v.capacity() * std::mem::size_of::<T>();
+            if bytes == 0 {
+                return;
+            }
+            let p = v.as_mut_ptr() as *mut u8;
+            let mut off = 0usize;
+            while off < bytes {
+                std::ptr::write_volatile(p.add(off), 0);
+                off += 4096;
+            }
+            std::ptr::write_volatile(p.add(bytes - 1), 0);
+        }
+        unsafe {
+            touch_uninit_cap(&mut self.col_uid);
+            touch_uninit_cap(&mut self.col_day);
+            touch_uninit_cap(&mut self.col_sessions);
+            touch_uninit_cap(&mut self.col_events);
+            touch_uninit_cap(&mut self.col_rev);
+            touch_uninit_cap(&mut self.def_bits);
+            touch_uninit_cap(&mut self.top_cat_vals);
+            touch_uninit_cap(&mut self.rle_buf);
+        }
     }
 
-    #[allow(dead_code)]
+    #[cold]
+    fn ensure_cap_or_flush(&mut self) {
+        if self.rg_rows >= MAX_RG_ROWS
+            || self.col_uid.len() >= MAX_VAR_BYTES
+            || self.top_cat_vals.len() >= MAX_VAR_BYTES
+        {
+            self.flush_rg();
+        }
+        if self.rg_rows >= self.cap_rows {
+            let nr = self.rg_rows;
+            if nr > 0 {
+                unsafe {
+                    self.col_day.set_len(nr);
+                    self.col_sessions.set_len(nr);
+                    self.col_events.set_len(nr);
+                    self.col_rev.set_len(nr);
+                    self.def_bits.set_len((nr + 7) >> 3);
+                }
+            }
+            let target = if self.cap_rows == 0 {
+                self.init_cap_rows
+            } else {
+                MAX_RG_ROWS
+            };
+            if self.col_uid.capacity() == 0 {
+                self.col_uid
+                    .reserve((target * 14 + 64).min(MAX_VAR_BYTES + 64).max(65_536));
+                self.top_cat_vals
+                    .reserve((target * 4 + 64).min(MAX_VAR_BYTES + 64).max(65_536));
+            }
+            self.col_day.reserve(target - nr);
+            self.col_sessions.reserve(target - nr);
+            self.col_events.reserve(target - nr);
+            self.col_rev.reserve(target - nr);
+            let cur_def = (nr + 7) >> 3;
+            let req_def = ((target + 7) >> 3) + 1;
+            if req_def > cur_def {
+                self.def_bits.reserve(req_def - cur_def);
+            }
+            self.cap_rows = target;
+        }
+    }
+
     #[inline(always)]
     pub fn push(
         &mut self,
@@ -455,12 +539,45 @@ impl UserDailyParquetWriter {
         revenue: i64,
         top_cat_idx: Option<usize>,
     ) {
-        if self.col_day.capacity() == 0 {
-            self.reserve_initial();
+        if self.rg_rows >= self.cap_rows
+            || self.col_uid.len() >= MAX_VAR_BYTES
+            || self.top_cat_vals.len() >= MAX_VAR_BYTES
+        {
+            self.ensure_cap_or_flush();
         }
         self.col_uid
             .extend_from_slice(&(uid_bytes.len() as u32).to_le_bytes());
         self.col_uid.extend_from_slice(uid_bytes);
+        self.push_tail_fields(day, sessions, events, revenue, top_cat_idx);
+    }
+
+    #[inline(always)]
+    pub fn push_prefixed_uid16(
+        &mut self,
+        uid_buf16: &[u8; 16],
+        ulen: usize,
+        day: i32,
+        sessions: i32,
+        events: i32,
+        revenue: i64,
+        top_cat_idx: Option<usize>,
+    ) {
+        if self.rg_rows >= self.cap_rows
+            || self.col_uid.len() >= MAX_VAR_BYTES
+            || self.top_cat_vals.len() >= MAX_VAR_BYTES
+        {
+            self.ensure_cap_or_flush();
+        }
+        let old_len = self.col_uid.len();
+        if old_len + 16 <= self.col_uid.capacity() {
+            unsafe {
+                let v = (uid_buf16.as_ptr() as *const [u8; 16]).read_unaligned();
+                (self.col_uid.as_mut_ptr().add(old_len) as *mut [u8; 16]).write_unaligned(v);
+                self.col_uid.set_len(old_len + ulen);
+            }
+        } else {
+            self.col_uid.extend_from_slice(&uid_buf16[..ulen]);
+        }
         self.push_tail_fields(day, sessions, events, revenue, top_cat_idx);
     }
 
@@ -474,10 +591,26 @@ impl UserDailyParquetWriter {
         revenue: i64,
         top_cat_idx: Option<usize>,
     ) {
-        if self.col_day.capacity() == 0 {
-            self.reserve_initial();
+        if self.rg_rows >= self.cap_rows
+            || self.col_uid.len() >= MAX_VAR_BYTES
+            || self.top_cat_vals.len() >= MAX_VAR_BYTES
+        {
+            self.ensure_cap_or_flush();
         }
-        self.col_uid.extend_from_slice(uid_prefixed);
+        let old_len = self.col_uid.len();
+        let ulen = uid_prefixed.len();
+        if old_len + ulen <= self.col_uid.capacity() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    uid_prefixed.as_ptr(),
+                    self.col_uid.as_mut_ptr().add(old_len),
+                    ulen,
+                );
+                self.col_uid.set_len(old_len + ulen);
+            }
+        } else {
+            self.col_uid.extend_from_slice(uid_prefixed);
+        }
         self.push_tail_fields(day, sessions, events, revenue, top_cat_idx);
     }
 
@@ -490,31 +623,23 @@ impl UserDailyParquetWriter {
         revenue: i64,
         top_cat_idx: Option<usize>,
     ) {
-        self.col_day.push(day);
-        self.col_sessions.push(sessions);
-        self.col_events.push(events);
-        self.col_rev.push(revenue);
-
         let idx = self.rg_rows;
-        if (idx & 7) == 0 {
-            self.def_bits.push(0);
-        }
-        if let Some(cid) = top_cat_idx {
-            let byte_idx = idx >> 3;
-            unsafe {
-                *self.def_bits.get_unchecked_mut(byte_idx) |= 1u8 << (idx & 7);
-            }
-            self.top_cat_vals
-                .extend_from_slice(&self.encoded_cats[cid]);
-        }
+        unsafe {
+            *self.col_day.as_mut_ptr().add(idx) = day;
+            *self.col_sessions.as_mut_ptr().add(idx) = sessions;
+            *self.col_events.as_mut_ptr().add(idx) = events;
+            *self.col_rev.as_mut_ptr().add(idx) = revenue;
 
-        self.rg_rows = idx + 1;
-        if self.rg_rows >= MAX_RG_ROWS
-            || self.col_uid.len() >= MAX_VAR_BYTES
-            || self.top_cat_vals.len() >= MAX_VAR_BYTES
-        {
-            self.flush_rg();
+            if (idx & 7) == 0 {
+                *self.def_bits.as_mut_ptr().add(idx >> 3) = 0;
+            }
+            if let Some(cid) = top_cat_idx {
+                *self.def_bits.as_mut_ptr().add(idx >> 3) |= 1u8 << (idx & 7);
+                let cat = self.encoded_cats.get_unchecked(cid);
+                self.top_cat_vals.extend_from_slice(cat);
+            }
         }
+        self.rg_rows = idx + 1;
     }
 
     #[cold]
@@ -522,95 +647,116 @@ impl UserDailyParquetWriter {
         if self.rg_rows == 0 {
             return;
         }
-        let w = self.writer.get_or_insert_with(|| {
-            let f = File::create(&self.path).expect("create user_daily parquet");
-            let mut bw = BufWriter::with_capacity(1 << 20, f);
-            bw.write_all(b"PAR1").expect("write PAR1");
+        let nr_usize = self.rg_rows;
+        unsafe {
+            self.col_day.set_len(nr_usize);
+            self.col_sessions.set_len(nr_usize);
+            self.col_events.set_len(nr_usize);
+            self.col_rev.set_len(nr_usize);
+            self.def_bits.set_len((nr_usize + 7) >> 3);
+        }
+        let is_first = self.file.is_none();
+        let f = self
+            .file
+            .get_or_insert_with(|| File::create(&self.path).expect("create user_daily parquet"));
+        if is_first {
             self.file_pos = 4;
-            bw
-        });
+        }
 
         let nr = self.rg_rows as i32;
-        let mut cols = Vec::with_capacity(6);
-        let mut rg_bytes = 0i64;
-
-        let c0 = write_required_column(
-            w,
-            &mut self.file_pos,
-            &mut self.hdr_buf,
-            0,
-            nr,
-            &self.col_uid,
-        );
-        rg_bytes += c0.total_size;
-        cols.push(c0);
-
-        let c1 = write_required_column(
-            w,
-            &mut self.file_pos,
-            &mut self.hdr_buf,
-            1,
-            nr,
-            as_le_bytes(&self.col_day),
-        );
-        rg_bytes += c1.total_size;
-        cols.push(c1);
-
-        let c2 = write_required_column(
-            w,
-            &mut self.file_pos,
-            &mut self.hdr_buf,
-            2,
-            nr,
-            as_le_bytes(&self.col_sessions),
-        );
-        rg_bytes += c2.total_size;
-        cols.push(c2);
-
-        let c3 = write_required_column(
-            w,
-            &mut self.file_pos,
-            &mut self.hdr_buf,
-            3,
-            nr,
-            as_le_bytes(&self.col_events),
-        );
-        rg_bytes += c3.total_size;
-        cols.push(c3);
-
-        let c4 = write_required_column(
-            w,
-            &mut self.file_pos,
-            &mut self.hdr_buf,
-            4,
-            nr,
-            as_le_bytes(&self.col_rev),
-        );
-        rg_bytes += c4.total_size;
-        cols.push(c4);
-
-        // Optional column 5: top_category
         encode_def_levels_bitwidth1(self.rg_rows, &self.def_bits, &mut self.rle_buf);
         let rle_len = self.rle_buf.len() as u32;
-        let payload_len = (4 + self.rle_buf.len() + self.top_cat_vals.len()) as i32;
-        let data_page_offset = self.file_pos;
-        encode_data_page_header(nr, payload_len, &mut self.hdr_buf);
-        w.write_all(&self.hdr_buf.0).expect("write top_cat hdr");
-        w.write_all(&rle_len.to_le_bytes())
-            .expect("write top_cat rle len");
-        w.write_all(&self.rle_buf).expect("write top_cat rle");
-        w.write_all(&self.top_cat_vals)
-            .expect("write top_cat vals");
-        let total_c5 = (self.hdr_buf.0.len() as i64) + (payload_len as i64);
-        self.file_pos += total_c5;
-        rg_bytes += total_c5;
-        cols.push(ColumnMetaRecord {
-            col_idx: 5,
-            data_page_offset,
-            total_size: total_c5,
-            num_values: nr as i64,
-            optional: true,
-        });
+        let rle_len_le = rle_len.to_le_bytes();
+
+        let p0 = self.col_uid.as_slice();
+        let p1 = as_le_bytes(&self.col_day);
+        let p2 = as_le_bytes(&self.col_sessions);
+        let p3 = as_le_bytes(&self.col_events);
+        let p4 = as_le_bytes(&self.col_rev);
+        let p5_payload_len = (4 + self.rle_buf.len() + self.top_cat_vals.len()) as i32;
+
+        self.hdr_buf.0.clear();
+        let h0 = append_data_page_header(nr, p0.len() as i32, &mut self.hdr_buf);
+        let h1 = append_data_page_header(nr, p1.len() as i32, &mut self.hdr_buf);
+        let h2 = append_data_page_header(nr, p2.len() as i32, &mut self.hdr_buf);
+        let h3 = append_data_page_header(nr, p3.len() as i32, &mut self.hdr_buf);
+        let h4 = append_data_page_header(nr, p4.len() as i32, &mut self.hdr_buf);
+        let h5 = append_data_page_header(nr, p5_payload_len, &mut self.hdr_buf);
+
+        let hb = self.hdr_buf.0.as_slice();
+        let hdr_slices = [
+            &hb[h0.0..h0.1],
+            &hb[h1.0..h1.1],
+            &hb[h2.0..h2.1],
+            &hb[h3.0..h3.1],
+            &hb[h4.0..h4.1],
+            &hb[h5.0..h5.1],
+        ];
+
+        let mut cols = Vec::with_capacity(6);
+        let mut rg_bytes = 0i64;
+        for (col_idx, (h, payload_len, optional)) in [
+            (hdr_slices[0], p0.len(), false),
+            (hdr_slices[1], p1.len(), false),
+            (hdr_slices[2], p2.len(), false),
+            (hdr_slices[3], p3.len(), false),
+            (hdr_slices[4], p4.len(), false),
+            (hdr_slices[5], p5_payload_len as usize, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let data_page_offset = self.file_pos;
+            let total_size = (h.len() + payload_len) as i64;
+            self.file_pos += total_size;
+            rg_bytes += total_size;
+            cols.push(ColumnMetaRecord {
+                col_idx,
+                data_page_offset,
+                total_size,
+                num_values: nr as i64,
+                optional,
+            });
+        }
+
+        if is_first {
+            let mut iovs = [
+                IoSlice::new(b"PAR1"),
+                IoSlice::new(hdr_slices[0]),
+                IoSlice::new(p0),
+                IoSlice::new(hdr_slices[1]),
+                IoSlice::new(p1),
+                IoSlice::new(hdr_slices[2]),
+                IoSlice::new(p2),
+                IoSlice::new(hdr_slices[3]),
+                IoSlice::new(p3),
+                IoSlice::new(hdr_slices[4]),
+                IoSlice::new(p4),
+                IoSlice::new(hdr_slices[5]),
+                IoSlice::new(&rle_len_le),
+                IoSlice::new(&self.rle_buf),
+                IoSlice::new(&self.top_cat_vals),
+            ];
+            write_all_iovec(f, &mut iovs);
+        } else {
+            let mut iovs = [
+                IoSlice::new(hdr_slices[0]),
+                IoSlice::new(p0),
+                IoSlice::new(hdr_slices[1]),
+                IoSlice::new(p1),
+                IoSlice::new(hdr_slices[2]),
+                IoSlice::new(p2),
+                IoSlice::new(hdr_slices[3]),
+                IoSlice::new(p3),
+                IoSlice::new(hdr_slices[4]),
+                IoSlice::new(p4),
+                IoSlice::new(hdr_slices[5]),
+                IoSlice::new(&rle_len_le),
+                IoSlice::new(&self.rle_buf),
+                IoSlice::new(&self.top_cat_vals),
+            ];
+            write_all_iovec(f, &mut iovs);
+        }
 
         self.rgs.push(RowGroupRecord {
             cols,
@@ -630,16 +776,14 @@ impl UserDailyParquetWriter {
 
     pub fn close(mut self) -> bool {
         self.flush_rg();
-        let Some(mut w) = self.writer else {
+        let Some(mut f) = self.file else {
             return false;
         };
-        let meta = encode_file_metadata(&USER_DAILY_COLS, self.total_rows, &self.rgs);
+        let mut meta = encode_file_metadata(&USER_DAILY_COLS, self.total_rows, &self.rgs);
         let meta_len = meta.len() as u32;
-        w.write_all(&meta).expect("write metadata");
-        w.write_all(&meta_len.to_le_bytes())
-            .expect("write metadata len");
-        w.write_all(b"PAR1").expect("write footer PAR1");
-        w.flush().expect("flush user_daily parquet");
+        meta.extend_from_slice(&meta_len.to_le_bytes());
+        meta.extend_from_slice(b"PAR1");
+        f.write_all(&meta).expect("write user_daily footer");
         true
     }
 }
@@ -744,7 +888,7 @@ mod tests {
 
         let cats = vec!["apparel".to_string(), "books".to_string(), "unknown".to_string()];
         let p_mix = dir.join("mixed.parquet");
-        let mut wr = UserDailyParquetWriter::new(p_mix.clone(), &cats);
+        let mut wr = UserDailyParquetWriter::new(p_mix.clone(), &cats, 4096);
         // Write 1025 rows spanning multiple RLE bit-packed runs (> 504 values)
         for i in 0..1025usize {
             let uid = format!("u_{i}");
