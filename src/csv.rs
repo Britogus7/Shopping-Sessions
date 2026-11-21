@@ -183,7 +183,7 @@ unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
         let mut prev_close63 = 0u64;
         let mut bad = 0u64;
         let mut n_delims = 0usize;
-        let mut n_nl = 0usize;
+        let mut exp_nl_idx = N - 1;
 
         while pos < blen {
             let rem = blen - pos;
@@ -208,6 +208,15 @@ unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
             prev_in_q = 0u64.wrapping_sub(in_q >> 63);
 
             let old_n = n_delims;
+            let mut nl = nl_m;
+            while nl != 0 {
+                let nl_bit = nl & nl.wrapping_neg();
+                let before = (delim & (nl_bit - 1)).count_ones() as usize;
+                bad |= ((old_n + before) ^ exp_nl_idx) as u64;
+                exp_nl_idx += N;
+                nl &= nl - 1;
+            }
+
             let cnt = delim.count_ones() as usize;
             let mut dst = pos_buf.as_mut_ptr().add(old_n);
             let p16 = pos as u16;
@@ -224,23 +233,10 @@ unsafe fn scan_csv_slice_batched_sink<const N: usize, M, PX, S: CsvRowSink<N>>(
                 dst = dst.add(4);
             }
             n_delims = old_n + cnt;
-            n_nl += nl_m.count_ones() as usize;
             pos += step;
         }
 
-        if (bad | prev_close63 | prev_in_q) == 0 && n_nl * N == n_delims {
-            let mut k = N - 1;
-            let pbase = pos_buf.as_ptr();
-            while k < n_delims {
-                if *ptr.add(*pbase.add(k) as usize) != b'\n' {
-                    bad = 1;
-                    break;
-                }
-                k += N;
-            }
-        }
-
-        if (bad | prev_close63 | prev_in_q) != 0 || n_nl * N != n_delims {
+        if (bad | prev_close63 | prev_in_q) != 0 || exp_nl_idx != n_delims + (N - 1) {
             for_each_data_line(blk, false, |line| {
                 if let Some(row) = parse_csv_line::<N>(line) {
                     sink.on_row(&row);
@@ -329,6 +325,7 @@ pub fn scan_csv_slice_sink<const N: usize, S: CsvRowSink<N>>(slice: &[u8], sink:
         if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vbmi2")
             && std::arch::is_x86_feature_detected!("pclmulqdq")
         {
             unsafe { scan_csv_slice_avx512_sink::<N, S>(slice, sink) };

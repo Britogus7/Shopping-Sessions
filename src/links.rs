@@ -157,6 +157,33 @@ impl LinkRedirect {
     }
 
     #[inline(always)]
+    pub fn has_bucket6(&self) -> bool {
+        self.num_buckets > 0
+    }
+
+    #[inline(always)]
+    pub fn prefetch_bloom_b37(&self, k: u64) -> u64 {
+        let h = crate::pack::mix42(k);
+        let w = (h as usize) & self.wmask;
+        prefetch_addr(unsafe { self.bitset.as_ptr().add(w) });
+        h
+    }
+
+    #[inline(always)]
+    pub fn bloom_test_b37(&self, h: u64) -> bool {
+        let (w, m) = bloom_word_and_mask(h, self.wmask);
+        let word = unsafe { *self.bitset.get_unchecked(w) };
+        (word & m) == m
+    }
+
+    #[inline(always)]
+    pub fn bucket6_slot_and_prefetch(&self, h: u64) -> usize {
+        let idx = bucket6_index(h, self.num_buckets);
+        prefetch_addr(unsafe { self.buckets.as_ptr().add(idx) });
+        idx
+    }
+
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.num_buckets == 0 && self.overflow_slots.is_empty()
     }

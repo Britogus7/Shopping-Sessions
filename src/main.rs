@@ -8,9 +8,6 @@ mod pipeline;
 use std::env;
 use std::path::PathBuf;
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 fn main() {
     let default_threads = std::thread::available_parallelism()
         .map(|n| n.get())

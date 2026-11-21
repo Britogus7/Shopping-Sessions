@@ -9,7 +9,6 @@ ahash = "0.8"
 hashbrown = { version = "0.15", features = ["raw-entry"] }
 memchr = "2.7"
 memmap2 = "0.9"
-mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 opt-level = 3

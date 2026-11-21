@@ -4,9 +4,6 @@ use std::fs::File;
 use std::io::{BufWriter, IoSlice, Write};
 use std::path::{Path, PathBuf};
 
-use ahash::RandomState;
-use hashbrown::HashMap;
-
 const _: () = assert!(cfg!(target_endian = "little"));
 
 const T_I32: u8 = 5;
@@ -466,83 +463,6 @@ fn encode_u8_bitpacked(vals: &[u8], bw: u8, out: &mut Vec<u8>) {
     }
 }
 
-fn write_bitpacked_u16_groups(slice: &[u16], bw: u8, out: &mut Vec<u8>) {
-    let bw_usize = bw as usize;
-    let total_vals = slice.len();
-    let mut off = 0usize;
-    while off < total_vals {
-        let run_vals = (total_vals - off).min(63 * 8);
-        let num_groups = (run_vals + 7) >> 3;
-        out.push(((num_groups << 1) | 1) as u8);
-        if bw <= 8 {
-            for _ in 0..num_groups {
-                let mut packed = 0u64;
-                let end = (off + 8).min(total_vals);
-                for (k, &v) in slice[off..end].iter().enumerate() {
-                    packed |= (v as u64) << (k * bw_usize);
-                }
-                out.extend_from_slice(&packed.to_le_bytes()[..bw_usize]);
-                off += 8;
-            }
-        } else {
-            for _ in 0..num_groups {
-                let mut packed = 0u128;
-                let end = (off + 8).min(total_vals);
-                for (k, &v) in slice[off..end].iter().enumerate() {
-                    packed |= (v as u128) << (k * bw_usize);
-                }
-                out.extend_from_slice(&packed.to_le_bytes()[..bw_usize]);
-                off += 8;
-            }
-        }
-    }
-}
-
-fn encode_u16_rle_hybrid(vals: &[u16], bw: u8, out: &mut Vec<u8>) {
-    debug_assert!((1..=16).contains(&bw));
-    out.clear();
-    out.push(bw);
-    let wb = ((bw as usize) + 7) >> 3;
-    let rle_thresh: usize = if bw >= 9 { 4 } else { 8 };
-    let len = vals.len();
-    let mut lit_start = 0usize;
-    let mut i = 0usize;
-    while i < len {
-        let v = unsafe { *vals.get_unchecked(i) };
-        let mut j = i + 1;
-        while j < len && unsafe { *vals.get_unchecked(j) } == v {
-            j += 1;
-        }
-        let run_len = j - i;
-        let lit_len = i - lit_start;
-        let rem = lit_len & 7;
-        let pad_need = if rem == 0 { 0 } else { 8 - rem };
-        if run_len >= pad_need + rle_thresh {
-            let lit_end = i + pad_need;
-            if lit_end > lit_start {
-                write_bitpacked_u16_groups(&vals[lit_start..lit_end], bw, out);
-            }
-            let rle_n = (run_len - pad_need) as u32;
-            let mut hdr = rle_n << 1;
-            if hdr < 0x80 {
-                out.push(hdr as u8);
-            } else {
-                while hdr >= 0x80 {
-                    out.push(((hdr as u8) & 0x7F) | 0x80);
-                    hdr >>= 7;
-                }
-                out.push(hdr as u8);
-            }
-            out.extend_from_slice(&v.to_le_bytes()[..wb]);
-            lit_start = j;
-        }
-        i = j;
-    }
-    if lit_start < len {
-        write_bitpacked_u16_groups(&vals[lit_start..], bw, out);
-    }
-}
-
 fn write_required_column(
     writer: &mut BufWriter<File>,
     file_pos: &mut i64,
@@ -602,15 +522,7 @@ pub struct UserDailyParquetWriter {
     sess_ids: Vec<u8>,
     sess_rle_buf: Vec<u8>,
     col_events: Vec<i32>,
-    ev_dict_vals: Vec<i32>,
-    ev_dict_ids: Vec<u16>,
-    ev_lut: Vec<u16>,
-    ev_rle_buf: Vec<u8>,
     col_rev: Vec<i64>,
-    rev_dict_vals: Vec<i64>,
-    rev_dict_ids: Vec<u16>,
-    rev_ht: Vec<u32>,
-    rev_rle_buf: Vec<u8>,
     def_bits: Vec<u8>,
     rle_buf: Vec<u8>,
     top_cat_ids: Vec<u8>,
@@ -697,15 +609,7 @@ impl UserDailyParquetWriter {
             sess_ids: Vec::new(),
             sess_rle_buf: Vec::new(),
             col_events: Vec::new(),
-            ev_dict_vals: Vec::new(),
-            ev_dict_ids: Vec::new(),
-            ev_lut: Vec::new(),
-            ev_rle_buf: Vec::new(),
             col_rev: Vec::new(),
-            rev_dict_vals: Vec::new(),
-            rev_dict_ids: Vec::new(),
-            rev_ht: Vec::new(),
-            rev_rle_buf: Vec::new(),
             def_bits: Vec::new(),
             rle_buf: Vec::new(),
             top_cat_ids: Vec::new(),
@@ -940,117 +844,6 @@ impl UserDailyParquetWriter {
             encode_u8_bitpacked(&self.sess_ids, bw, &mut self.sess_rle_buf);
         }
 
-        // Col 3: events (RLE_DICTIONARY up to 32,768 unique values per RG, else PLAIN)
-        const MAX_EV_DICT: usize = 32_768;
-        if self.ev_lut.is_empty() {
-            self.ev_lut.resize(4096, u16::MAX);
-        }
-        self.ev_dict_vals.clear();
-        self.ev_dict_ids.clear();
-        self.ev_dict_ids.reserve(nr_usize);
-        let mut ev_extra_map: HashMap<i32, u16, RandomState> =
-            HashMap::with_hasher(RandomState::with_seeds(1, 2, 3, 4));
-        let mut use_ev_dict = true;
-        for &v in &self.col_events {
-            let id = if (v as u32) < 4096 {
-                let cur = unsafe { *self.ev_lut.get_unchecked(v as usize) };
-                if cur != u16::MAX {
-                    cur
-                } else {
-                    let n = self.ev_dict_vals.len();
-                    if n >= MAX_EV_DICT {
-                        use_ev_dict = false;
-                        break;
-                    }
-                    let nid = n as u16;
-                    unsafe { *self.ev_lut.get_unchecked_mut(v as usize) = nid };
-                    self.ev_dict_vals.push(v);
-                    nid
-                }
-            } else if let Some(&cur) = ev_extra_map.get(&v) {
-                cur
-            } else {
-                let n = self.ev_dict_vals.len();
-                if n >= MAX_EV_DICT {
-                    use_ev_dict = false;
-                    break;
-                }
-                let nid = n as u16;
-                ev_extra_map.insert(v, nid);
-                self.ev_dict_vals.push(v);
-                nid
-            };
-            self.ev_dict_ids.push(id);
-        }
-        for &v in &self.ev_dict_vals {
-            if (v as u32) < 4096 {
-                unsafe { *self.ev_lut.get_unchecked_mut(v as usize) = u16::MAX };
-            }
-        }
-        if use_ev_dict {
-            let dlen = self.ev_dict_vals.len();
-            let bw = if dlen <= 2 {
-                1u8
-            } else {
-                (32 - ((dlen - 1) as u32).leading_zeros()) as u8
-            };
-            encode_u16_rle_hybrid(&self.ev_dict_ids, bw, &mut self.ev_rle_buf);
-        }
-
-        // Col 4: revenue_cents (RLE_DICTIONARY with 0 at dict[0] + 64K hash table, fallback PLAIN)
-        const MAX_REV_DICT: usize = 32_768;
-        if self.rev_ht.is_empty() {
-            self.rev_ht.resize(65_536, 0);
-        } else {
-            self.rev_ht.fill(0);
-        }
-        self.rev_dict_vals.clear();
-        self.rev_dict_vals.push(0i64);
-        self.rev_dict_ids.clear();
-        self.rev_dict_ids.reserve(nr_usize);
-        let mut use_rev_dict = true;
-        for &v in &self.col_rev {
-            if v == 0 {
-                self.rev_dict_ids.push(0);
-                continue;
-            }
-            let h = (v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let mut pos = ((h ^ (h >> 32)) as usize) & 65_535;
-            loop {
-                let slot = unsafe { *self.rev_ht.get_unchecked(pos) };
-                if slot == 0 {
-                    let n = self.rev_dict_vals.len();
-                    if n >= MAX_REV_DICT {
-                        use_rev_dict = false;
-                        break;
-                    }
-                    let nid = n as u16;
-                    unsafe { *self.rev_ht.get_unchecked_mut(pos) = (nid as u32) + 1 };
-                    self.rev_dict_vals.push(v);
-                    self.rev_dict_ids.push(nid);
-                    break;
-                }
-                let id = (slot - 1) as usize;
-                if unsafe { *self.rev_dict_vals.get_unchecked(id) } == v {
-                    self.rev_dict_ids.push(id as u16);
-                    break;
-                }
-                pos = (pos + 1) & 65_535;
-            }
-            if !use_rev_dict {
-                break;
-            }
-        }
-        if use_rev_dict {
-            let dlen = self.rev_dict_vals.len();
-            let bw = if dlen <= 2 {
-                1u8
-            } else {
-                (32 - ((dlen - 1) as u32).leading_zeros()) as u8
-            };
-            encode_u16_rle_hybrid(&self.rev_dict_ids, bw, &mut self.rev_rle_buf);
-        }
-
         encode_def_levels_bitwidth1(self.rg_rows, &self.def_bits, &mut self.rle_buf);
         let rle_len = self.rle_buf.len() as u32;
         let rle_len_le = rle_len.to_le_bytes();
@@ -1074,20 +867,8 @@ impl UserDailyParquetWriter {
         } else {
             p2_plain
         };
-        let p3_dict = as_le_bytes(&self.ev_dict_vals);
-        let p3_plain = as_le_bytes(&self.col_events);
-        let p3_data: &[u8] = if use_ev_dict {
-            &self.ev_rle_buf
-        } else {
-            p3_plain
-        };
-        let p4_dict = as_le_bytes(&self.rev_dict_vals);
-        let p4_plain = as_le_bytes(&self.col_rev);
-        let p4_data: &[u8] = if use_rev_dict {
-            &self.rev_rle_buf
-        } else {
-            p4_plain
-        };
+        let p3_data = as_le_bytes(&self.col_events);
+        let p4_data = as_le_bytes(&self.col_rev);
         let p5_vals: &[u8] = if emit_cat_dict {
             &self.cat_rle_buf
         } else {
@@ -1142,44 +923,8 @@ impl UserDailyParquetWriter {
             },
             &mut self.hdr_buf,
         );
-        let dh3 = if use_ev_dict {
-            append_dict_page_header(
-                self.ev_dict_vals.len() as i32,
-                p3_dict.len() as i32,
-                &mut self.hdr_buf,
-            )
-        } else {
-            (0, 0)
-        };
-        let h3 = append_data_page_header_enc(
-            nr,
-            p3_data.len() as i32,
-            if use_ev_dict {
-                ENC_RLE_DICTIONARY
-            } else {
-                ENC_PLAIN
-            },
-            &mut self.hdr_buf,
-        );
-        let dh4 = if use_rev_dict {
-            append_dict_page_header(
-                self.rev_dict_vals.len() as i32,
-                p4_dict.len() as i32,
-                &mut self.hdr_buf,
-            )
-        } else {
-            (0, 0)
-        };
-        let h4 = append_data_page_header_enc(
-            nr,
-            p4_data.len() as i32,
-            if use_rev_dict {
-                ENC_RLE_DICTIONARY
-            } else {
-                ENC_PLAIN
-            },
-            &mut self.hdr_buf,
-        );
+        let h3 = append_data_page_header_enc(nr, p3_data.len() as i32, ENC_PLAIN, &mut self.hdr_buf);
+        let h4 = append_data_page_header_enc(nr, p4_data.len() as i32, ENC_PLAIN, &mut self.hdr_buf);
         let dh5 = if emit_cat_dict {
             append_dict_page_header(
                 self.num_cats as i32,
@@ -1230,7 +975,7 @@ impl UserDailyParquetWriter {
         iovs.push(IoSlice::new(h0_s));
         iovs.push(IoSlice::new(p0_idx));
 
-        // Cols 1..=4: day, sessions, events, revenue_cents (dict + RLE_DICTIONARY or PLAIN)
+        // Cols 1..=4: day, sessions (dict or PLAIN), events, revenue_cents (zero-copy PLAIN)
         for (col_idx, use_dict, dh_rng, dict_bytes, h_rng, data_bytes) in [
             (
                 1usize,
@@ -1248,8 +993,8 @@ impl UserDailyParquetWriter {
                 h2,
                 p2_data,
             ),
-            (3usize, use_ev_dict, dh3, p3_dict, h3, p3_data),
-            (4usize, use_rev_dict, dh4, p4_dict, h4, p4_data),
+            (3usize, false, (0, 0), &[][..], h3, p3_data),
+            (4usize, false, (0, 0), &[][..], h4, p4_data),
         ] {
             let dh_s = &hb[dh_rng.0..dh_rng.1];
             let h_s = &hb[h_rng.0..h_rng.1];
@@ -1521,100 +1266,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn decode_u16_rle_hybrid_ref(enc: &[u8], n: usize) -> Vec<u16> {
-        let bw = enc[0];
-        let bw_u = bw as usize;
-        let wb = (bw_u + 7) >> 3;
-        let mask = if bw_u == 16 { 0xFFFFu128 } else { (1u128 << bw_u) - 1 };
-        let mut p = 1usize;
-        let mut out = Vec::with_capacity(n);
-        while out.len() < n {
-            let mut hdr = 0u32;
-            let mut shift = 0u32;
-            loop {
-                let b = enc[p];
-                p += 1;
-                hdr |= ((b & 0x7F) as u32) << shift;
-                if (b & 0x80) == 0 {
-                    break;
-                }
-                shift += 7;
-            }
-            if (hdr & 1) == 1 {
-                let num_groups = (hdr >> 1) as usize;
-                for _ in 0..num_groups {
-                    let mut raw = [0u8; 16];
-                    raw[..bw_u].copy_from_slice(&enc[p..p + bw_u]);
-                    p += bw_u;
-                    let w = u128::from_le_bytes(raw);
-                    for k in 0..8 {
-                        if out.len() < n {
-                            out.push(((w >> (k * bw_u)) & mask) as u16);
-                        }
-                    }
-                }
-            } else {
-                let cnt = (hdr >> 1) as usize;
-                let mut raw = [0u8; 2];
-                raw[..wb].copy_from_slice(&enc[p..p + wb]);
-                p += wb;
-                let val = u16::from_le_bytes(raw);
-                for _ in 0..cnt {
-                    if out.len() < n {
-                        out.push(val);
-                    }
-                }
-            }
-        }
-        assert_eq!(p, enc.len(), "trailing bytes in hybrid stream (bw={bw})");
-        out
-    }
-
     #[test]
-    fn rle_hybrid_u16_roundtrip_and_dict_fallbacks() {
-        let mut enc = Vec::new();
-        for bw in 1u8..=16 {
-            let max_v = if bw == 16 { u16::MAX } else { ((1u32 << bw) - 1) as u16 };
-            // 1) All zeros (single RLE run)
-            let zeros = vec![0u16; 333];
-            encode_u16_rle_hybrid(&zeros, bw, &mut enc);
-            assert_eq!(decode_u16_rle_hybrid_ref(&enc, zeros.len()), zeros, "zeros bw={bw}");
-
-            // 2) Mixed alignments 0..8 before repeated runs + > 504 literal values
-            for align in 0..8usize {
-                let mut v = Vec::new();
-                for k in 0..(600 + align) {
-                    v.push(((k * 13 + 3) as u16) & max_v);
-                }
-                let rep_val = 7u16 & max_v;
-                v.extend(std::iter::repeat(rep_val).take(25));
-                for k in 0..11 {
-                    v.push(((k + 1) as u16) & max_v);
-                }
-                v.extend(std::iter::repeat(max_v).take(17));
-                if align & 1 == 1 {
-                    v.push(0);
-                    v.push(1 & max_v);
-                }
-                encode_u16_rle_hybrid(&v, bw, &mut enc);
-                assert_eq!(
-                    decode_u16_rle_hybrid_ref(&enc, v.len()),
-                    v,
-                    "mixed bw={bw} align={align}"
-                );
-            }
-        }
-
-        // 3) UserDailyParquetWriter high-cardinality PLAIN fallback for sessions, events, revenue_cents
+    fn user_daily_sessions_dict_and_plain_fallback() {
         let dir = std::env::temp_dir().join("shopping_pq_fallback_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cats = vec!["apparel".to_string()];
+
+        // 1) Low-cardinality sessions (<= 255) uses RLE_DICTIONARY; events & revenue_cents are PLAIN
+        let p_dict = dir.join("sessions_dict.parquet");
+        let mut wr_d = UserDailyParquetWriter::new(p_dict.clone(), &cats, 21_000, 14, 4096);
+        for i in 0..512i32 {
+            let uid = format!("d_{:05}", i);
+            wr_d.push_user_day(
+                uid.as_bytes(),
+                false,
+                21_000 + (i % 14),
+                1 + (i % 12),
+                1 + i * 3,
+                if i % 3 == 0 { 0 } else { (i as i64) * 100 + 7 },
+                if i % 5 == 0 { Some(0) } else { None },
+            );
+        }
+        assert!(wr_d.close());
+        let b_d = std::fs::read(&p_dict).unwrap();
+        assert!(b_d.starts_with(b"PAR1"));
+        assert!(b_d.ends_with(b"PAR1"));
+
+        // 2) sessions > 255 triggers PLAIN fallback cleanly alongside large events & revenue_cents
         let p_fb = dir.join("fallback.parquet");
         let mut wr = UserDailyParquetWriter::new(p_fb.clone(), &cats, 21_000, 14, 4096);
         for i in 0..35_000i32 {
             let uid = format!("u_{:05}", i);
-            // Trigger: sessions > 255, events > 32_768 distinct (incl. > 4096), revenue > 32_768 distinct
             wr.push_user_day(
                 uid.as_bytes(),
                 false,
