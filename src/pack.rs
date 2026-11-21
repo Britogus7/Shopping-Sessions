@@ -13,7 +13,6 @@ pub const B37_LIMIT: u64 = 1u64 << 42;
 pub const MASK42: u64 = B37_LIMIT - 1;
 
 const M42_A: u64 = 0x2A5F_9B3D_17C5;
-const M42_B: u64 = 0x1D4E_A76B_39F1;
 
 const fn inv_mod_2_42(a: u64) -> u64 {
     let mut inv = 1u64;
@@ -26,7 +25,6 @@ const fn inv_mod_2_42(a: u64) -> u64 {
 }
 
 const M42_A_INV: u64 = inv_mod_2_42(M42_A);
-const M42_B_INV: u64 = inv_mod_2_42(M42_B);
 
 const POW37: [u64; 8] = [
     1,
@@ -62,7 +60,6 @@ const B37_DEC: [u8; 37] = [
 
 const _: () = {
     assert!((M42_A.wrapping_mul(M42_A_INV) & MASK42) == 1);
-    assert!((M42_B.wrapping_mul(M42_B_INV) & MASK42) == 1);
     assert!(37 * POW37[7] == 3_512_479_453_921);
     assert!(37 * POW37[7] < B37_LIMIT);
 };
@@ -82,16 +79,12 @@ pub fn mix64(mut x: u64) -> u64 {
 pub fn mix42(mut x: u64) -> u64 {
     x ^= x >> 21;
     x = x.wrapping_mul(M42_A) & MASK42;
-    x ^= x >> 21;
-    x = x.wrapping_mul(M42_B) & MASK42;
     x ^ (x >> 21)
 }
 
 /// Exact inverse of `mix42`.
 #[inline(always)]
 pub fn unmix42(mut x: u64) -> u64 {
-    x ^= x >> 21;
-    x = x.wrapping_mul(M42_B_INV) & MASK42;
     x ^= x >> 21;
     x = x.wrapping_mul(M42_A_INV) & MASK42;
     x ^ (x >> 21)

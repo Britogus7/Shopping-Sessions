@@ -4,7 +4,9 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as MemOrdering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering as MemOrdering,
+};
 
 use memmap2::{Mmap, MmapOptions};
 
@@ -35,13 +37,49 @@ const _: () = {
     assert!(std::mem::align_of::<AtomicRedirectSlot>() == 8);
 };
 
-const LINK_BLOOM_MAX_SHIFT: u32 = 16; // 1<<16 words = 512 KB
+const LINK_BLOOM_MAX_SHIFT: u32 = 17; // 1<<17 words = 1 MB
+const BUCKET_PROBED_NEXT: u32 = 0x4000_0000;
+const BUCKET_HAS_OVERFLOW: u32 = 0x8000_0000;
+const BUCKET_FLAG_MASK: u32 = BUCKET_PROBED_NEXT | BUCKET_HAS_OVERFLOW;
+const BUCKET_CNT_MASK: u32 = !BUCKET_FLAG_MASK;
+const OV_SLOT_TAG: usize = 1usize << 63;
+const BUCKET6_MIN_REDIRECTS: usize = 16_384;
+const BUCKET6_MAX_PROBE: usize = 8;
+const BUCKET6_MIN_BUCKETS: usize = 20_480;
+
+const _: () = assert!(BUCKET6_MIN_BUCKETS >= 2048 * (BUCKET6_MAX_PROBE + 1));
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Bucket6 {
+    tags: [u32; 6],    // 24 B: ((h as u32) & 0x7FFF_FFFF) | 0x8000_0000; 0 = empty
+    vals_lo: [u32; 6], // 24 B: low 32 bits of encoded_canon (< B37_LIMIT)
+    vals_hi: [u16; 6], // 12 B: high 10 bits of encoded_canon
+    meta: u32,         //  4 B: slot fill count; > 6 or BUCKET_HAS_OVERFLOW => check overflow_slots
+}
+
+#[repr(C, align(64))]
+struct AtomicBucket6 {
+    tags: [AtomicU32; 6],
+    vals_lo: [AtomicU32; 6],
+    vals_hi: [AtomicU16; 6],
+    meta: AtomicU32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Bucket6>() == 64);
+    assert!(std::mem::align_of::<Bucket6>() == 64);
+    assert!(std::mem::size_of::<AtomicBucket6>() == 64);
+    assert!(std::mem::align_of::<AtomicBucket6>() == 64);
+};
 
 pub struct LinkRedirect {
     bitset: HugeZeroed<u64>,
     wmask: usize,
-    slots: HugeZeroed<RedirectSlot>,
-    smask: usize,
+    buckets: HugeZeroed<Bucket6>,
+    num_buckets: usize,
+    overflow_slots: HugeZeroed<RedirectSlot>,
+    ov_mask: usize,
 }
 
 #[inline(always)]
@@ -51,6 +89,16 @@ fn bloom_word_and_mask(h: u64, wmask: usize) -> (usize, u64) {
         | (1u64 << ((h >> 30) & 63))
         | (1u64 << ((h >> 36) & 63));
     (w, m)
+}
+
+#[inline(always)]
+fn bucket6_index(h: u64, num_buckets: usize) -> usize {
+    (((h as u128) * (num_buckets as u128)) >> 42) as usize
+}
+
+#[inline(always)]
+fn bucket6_tag(h: u64) -> u32 {
+    ((h as u32) & 0x7FFF_FFFF) | 0x8000_0000
 }
 
 #[inline(always)]
@@ -66,19 +114,51 @@ fn prefetch_addr<T>(ptr: *const T) {
     let _ = ptr;
 }
 
+#[inline(always)]
+fn match_bucket6_tag(b: &Bucket6, tag: u32) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        unsafe {
+            let v = _mm256_load_si256(b as *const Bucket6 as *const __m256i);
+            let cmp = _mm256_cmpeq_epi32(v, _mm256_set1_epi32(tag as i32));
+            let m = (_mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32) & 0x3F;
+            if m != 0 {
+                let lane = m.trailing_zeros() as usize;
+                return Some(
+                    (*b.vals_lo.get_unchecked(lane) as u64)
+                        | ((*b.vals_hi.get_unchecked(lane) as u64) << 32),
+                );
+            }
+        }
+        return None;
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        for lane in 0..6 {
+            if b.tags[lane] == tag {
+                return Some((b.vals_lo[lane] as u64) | ((b.vals_hi[lane] as u64) << 32));
+            }
+        }
+        None
+    }
+}
+
 impl LinkRedirect {
     pub fn empty() -> Self {
         Self {
             bitset: HugeZeroed::new(0),
             wmask: 0,
-            slots: HugeZeroed::new(0),
-            smask: 0,
+            buckets: HugeZeroed::new(0),
+            num_buckets: 0,
+            overflow_slots: HugeZeroed::new(0),
+            ov_mask: 0,
         }
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.num_buckets == 0 && self.overflow_slots.is_empty()
     }
 
     #[inline(always)]
@@ -92,7 +172,7 @@ impl LinkRedirect {
     }
 
     #[inline(always)]
-    pub fn bloom_hit_slot_with_hash(&self, h: u64) -> Option<usize> {
+    pub fn bloom_hit_slot_with_hash(&self, k: u64, h: u64) -> Option<usize> {
         if self.is_empty() {
             return None;
         }
@@ -101,28 +181,77 @@ impl LinkRedirect {
         if (word & m) != m {
             return None;
         }
-        Some(((h >> 16) as usize) & self.smask)
+        if k < B37_LIMIT && self.num_buckets > 0 {
+            Some(bucket6_index(h, self.num_buckets))
+        } else if !self.overflow_slots.is_empty() {
+            Some(OV_SLOT_TAG | (((h >> 16) as usize) & self.ov_mask))
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn prefetch_slot(&self, idx: usize) {
-        prefetch_addr(unsafe { self.slots.as_ptr().add(idx) });
+        if (idx & OV_SLOT_TAG) == 0 {
+            prefetch_addr(unsafe { self.buckets.as_ptr().add(idx) });
+        } else {
+            prefetch_addr(unsafe { self.overflow_slots.as_ptr().add(idx & !OV_SLOT_TAG) });
+        }
     }
 
-    /// Resolve a user key `k` whose `link_hash(k) == h` using pre-computed slot `idx`.
-    /// Returns `mix42(person)` when `person < B37_LIMIT`, or raw `person` otherwise.
     #[inline(always)]
-    pub fn resolve_from_slot_hashed(&self, k: u64, h: u64, mut idx: usize) -> u64 {
+    fn resolve_overflow(&self, k: u64, h: u64, mut idx: usize) -> u64 {
+        if self.overflow_slots.is_empty() {
+            return if k < B37_LIMIT { h } else { k };
+        }
         loop {
-            let s = unsafe { *self.slots.get_unchecked(idx) };
+            let s = unsafe { *self.overflow_slots.get_unchecked(idx) };
             if s.key == k {
                 return s.val;
             }
             if s.key == EMPTY_KEY {
                 return if k < B37_LIMIT { h } else { k };
             }
-            idx = (idx + 1) & self.smask;
+            idx = (idx + 1) & self.ov_mask;
         }
+    }
+
+    /// Resolve a user key `k` whose `link_hash(k) == h` using pre-computed slot `sidx`.
+    /// Returns `mix42(person)` when `person < B37_LIMIT`, or raw `person` otherwise.
+    #[inline(always)]
+    pub fn resolve_from_slot_hashed(&self, k: u64, h: u64, sidx: usize) -> u64 {
+        if (sidx & OV_SLOT_TAG) == 0 {
+            let b = unsafe { self.buckets.get_unchecked(sidx) };
+            let tag = bucket6_tag(h);
+            if let Some(val) = match_bucket6_tag(b, tag) {
+                return val;
+            }
+            let home_meta = b.meta;
+            if (home_meta & BUCKET_FLAG_MASK) == 0 {
+                return h;
+            }
+            if (home_meta & BUCKET_PROBED_NEXT) != 0 {
+                let mut cur = sidx;
+                for _ in 1..BUCKET6_MAX_PROBE {
+                    cur += 1;
+                    if cur >= self.num_buckets {
+                        cur = 0;
+                    }
+                    let nb = unsafe { self.buckets.get_unchecked(cur) };
+                    if let Some(val) = match_bucket6_tag(nb, tag) {
+                        return val;
+                    }
+                    if (nb.meta & BUCKET_PROBED_NEXT) == 0 {
+                        break;
+                    }
+                }
+            }
+            if (home_meta & BUCKET_HAS_OVERFLOW) != 0 {
+                return self.resolve_overflow(k, h, ((h >> 16) as usize) & self.ov_mask);
+            }
+            return h;
+        }
+        self.resolve_overflow(k, h, sidx & !OV_SLOT_TAG)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -132,7 +261,7 @@ impl LinkRedirect {
             return k;
         }
         let h = link_hash(k);
-        let Some(idx) = self.bloom_hit_slot_with_hash(h) else {
+        let Some(idx) = self.bloom_hit_slot_with_hash(k, h) else {
             return k;
         };
         decode_canon_val(self.resolve_from_slot_hashed(k, h, idx))
@@ -248,50 +377,95 @@ fn union_min_zero(
     }
 }
 
-fn finalize_redirect_table<F>(num_redirects: usize, fill: F) -> LinkRedirect
+#[inline(always)]
+fn redirect_table_dims(num_redirects: usize) -> (usize, usize, usize) {
+    let num_buckets = if num_redirects >= BUCKET6_MIN_REDIRECTS {
+        ((num_redirects * 10) / 48).max(BUCKET6_MIN_BUCKETS)
+    } else {
+        0
+    };
+    let num_words = (num_redirects / 4)
+        .next_power_of_two()
+        .clamp(64, 1 << LINK_BLOOM_MAX_SHIFT);
+    (num_buckets, num_words, num_words - 1)
+}
+
+#[inline(always)]
+fn overflow_table_cap(ov_total: usize) -> usize {
+    (ov_total * 10 / 7)
+        .max(ov_total + 64)
+        .next_power_of_two()
+        .max(64)
+}
+
+fn finalize_redirect_table<F>(num_redirects: usize, num_threads: usize, fill: F) -> LinkRedirect
 where
-    F: FnOnce(&[AtomicRedirectSlot], &[AtomicU64], usize, usize),
+    F: FnOnce(&[AtomicBucket6], &[AtomicU64], usize, usize) -> Vec<Vec<(u64, u64, u64)>>,
 {
     if num_redirects == 0 {
         return LinkRedirect::empty();
     }
-    let slots_cap = (num_redirects * 10 / 7)
-        .max(num_redirects + 64)
-        .next_power_of_two()
-        .max(64);
-    let smask = slots_cap - 1;
-    let atomic_sec: HugeZeroed<AtomicRedirectSlot> = HugeZeroed::new(slots_cap);
-
-    let num_words = (num_redirects / 4)
-        .next_power_of_two()
-        .clamp(64, 1 << LINK_BLOOM_MAX_SHIFT);
-    let wmask = num_words - 1;
+    let (num_buckets, num_words, wmask) = redirect_table_dims(num_redirects);
+    let atomic_buckets: HugeZeroed<AtomicBucket6> = HugeZeroed::new(num_buckets);
     let atomic_bitset: HugeZeroed<AtomicU64> = HugeZeroed::new(num_words);
 
-    fill(&atomic_sec, &atomic_bitset, smask, wmask);
+    let ov_lists = fill(&atomic_buckets, &atomic_bitset, num_buckets, wmask);
+    let ov_total: usize = ov_lists.iter().map(|v| v.len()).sum();
+
+    let (overflow_slots, ov_mask) = if ov_total > 0 {
+        let ov_cap = overflow_table_cap(ov_total);
+        let mask = ov_cap - 1;
+        let atomic_ov: HugeZeroed<AtomicRedirectSlot> = HugeZeroed::new(ov_cap);
+        if ov_total < 4096 || num_threads <= 1 {
+            for list in &ov_lists {
+                for &(k, ev, h) in list {
+                    insert_overflow_slot_with_hash(&atomic_ov, mask, k, ev, h);
+                }
+            }
+        } else {
+            let asl: &[AtomicRedirectSlot] = &atomic_ov;
+            let lists_ref = &ov_lists;
+            std::thread::scope(|s| {
+                let mut hs = Vec::with_capacity(lists_ref.len());
+                for list in lists_ref {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    hs.push(s.spawn(move || {
+                        for &(k, ev, h) in list {
+                            insert_overflow_slot_with_hash(asl, mask, k, ev, h);
+                        }
+                    }));
+                }
+                for h in hs {
+                    h.join().unwrap();
+                }
+            });
+        }
+        (atomic_ov.reinterpret::<RedirectSlot>(), mask)
+    } else {
+        (HugeZeroed::new(0), 0)
+    };
 
     LinkRedirect {
         bitset: atomic_bitset.reinterpret::<u64>(),
         wmask,
-        slots: atomic_sec.reinterpret::<RedirectSlot>(),
-        smask,
+        buckets: atomic_buckets.reinterpret::<Bucket6>(),
+        num_buckets,
+        overflow_slots,
+        ov_mask,
     }
 }
 
 #[inline(always)]
-fn insert_redirect_slot_with_hash(
+fn insert_overflow_slot_with_hash(
     asl: &[AtomicRedirectSlot],
-    abs: &[AtomicU64],
-    smask: usize,
-    wmask: usize,
+    mask: usize,
     key: u64,
     encoded_val: u64,
     h: u64,
 ) {
-    let (w, m) = bloom_word_and_mask(h, wmask);
-    unsafe { abs.get_unchecked(w) }.fetch_or(m, MemOrdering::Relaxed);
-
-    let mut idx = ((h >> 16) as usize) & smask;
+    let mut idx = ((h >> 16) as usize) & mask;
     loop {
         let s_ref = unsafe { asl.get_unchecked(idx) };
         if s_ref
@@ -302,27 +476,86 @@ fn insert_redirect_slot_with_hash(
             s_ref.val.store(encoded_val, MemOrdering::Relaxed);
             break;
         }
-        idx = (idx + 1) & smask;
+        idx = (idx + 1) & mask;
     }
 }
 
 #[inline(always)]
-fn insert_redirect_slot(
-    asl: &[AtomicRedirectSlot],
+fn insert_bucket6_with_hash(
+    buckets: &[AtomicBucket6],
     abs: &[AtomicU64],
-    smask: usize,
+    num_buckets: usize,
+    wmask: usize,
+    key: u64,
+    encoded_val: u64,
+    h: u64,
+    local_ov: &mut Vec<(u64, u64, u64)>,
+) {
+    let (w, m) = bloom_word_and_mask(h, wmask);
+    unsafe { abs.get_unchecked(w) }.fetch_or(m, MemOrdering::Relaxed);
+
+    if num_buckets > 0 && key < B37_LIMIT {
+        let home = bucket6_index(h, num_buckets);
+        if encoded_val < B37_LIMIT {
+            let tag = bucket6_tag(h);
+            let mut bidx = home;
+            for step in 0..BUCKET6_MAX_PROBE {
+                let b = unsafe { buckets.get_unchecked(bidx) };
+                if (b.meta.load(MemOrdering::Relaxed) & BUCKET_CNT_MASK) < 6 {
+                    let slot = (b.meta.fetch_add(1, MemOrdering::Relaxed) & BUCKET_CNT_MASK) as usize;
+                    if slot < 6 {
+                        unsafe {
+                            b.tags
+                                .get_unchecked(slot)
+                                .store(tag, MemOrdering::Relaxed);
+                            b.vals_lo
+                                .get_unchecked(slot)
+                                .store(encoded_val as u32, MemOrdering::Relaxed);
+                            b.vals_hi
+                                .get_unchecked(slot)
+                                .store((encoded_val >> 32) as u16, MemOrdering::Relaxed);
+                        }
+                        return;
+                    }
+                }
+                if step + 1 < BUCKET6_MAX_PROBE {
+                    if (b.meta.load(MemOrdering::Relaxed) & BUCKET_PROBED_NEXT) == 0 {
+                        b.meta.fetch_or(BUCKET_PROBED_NEXT, MemOrdering::Relaxed);
+                    }
+                    bidx += 1;
+                    if bidx >= num_buckets {
+                        bidx = 0;
+                    }
+                }
+            }
+        }
+        let hb = unsafe { buckets.get_unchecked(home) };
+        if (hb.meta.load(MemOrdering::Relaxed) & BUCKET_HAS_OVERFLOW) == 0 {
+            hb.meta.fetch_or(BUCKET_HAS_OVERFLOW, MemOrdering::Relaxed);
+        }
+    }
+    local_ov.push((key, encoded_val, h));
+}
+
+#[inline(always)]
+fn insert_bucket6_canon(
+    buckets: &[AtomicBucket6],
+    abs: &[AtomicU64],
+    num_buckets: usize,
     wmask: usize,
     key: u64,
     canon: u64,
+    local_ov: &mut Vec<(u64, u64, u64)>,
 ) {
-    insert_redirect_slot_with_hash(
-        asl,
+    insert_bucket6_with_hash(
+        buckets,
         abs,
-        smask,
+        num_buckets,
         wmask,
         key,
         encode_canon_val(canon),
         link_hash(key),
+        local_ov,
     );
 }
 
@@ -466,6 +699,389 @@ impl CsvRowSink<2> for LinkSink<'_> {
     }
 }
 
+#[inline(always)]
+fn intern_node_st(
+    keys: &mut [u64],
+    mask: usize,
+    k: u64,
+    num_nodes: &mut usize,
+    max_nodes: usize,
+) -> Option<u32> {
+    let mut pos = (mix64(k) as usize) & mask;
+    let mut probes = 0usize;
+    loop {
+        let cur = unsafe { *keys.get_unchecked(pos) };
+        if cur == k {
+            return Some(pos as u32);
+        }
+        if cur == EMPTY_KEY {
+            *num_nodes += 1;
+            if *num_nodes > max_nodes {
+                return None;
+            }
+            unsafe { *keys.get_unchecked_mut(pos) = k };
+            return Some(pos as u32);
+        }
+        probes += 1;
+        if probes > 1024 && probes > mask {
+            return None;
+        }
+        pos = (pos + 1) & mask;
+    }
+}
+
+#[inline(always)]
+fn find_root_zero_st(parent: &mut [u32], mut x: u32) -> u32 {
+    loop {
+        let p_raw = unsafe { *parent.get_unchecked(x as usize) };
+        if p_raw == 0 {
+            return x;
+        }
+        let p = p_raw - 1;
+        let gp_raw = unsafe { *parent.get_unchecked(p as usize) };
+        if gp_raw != 0 {
+            unsafe { *parent.get_unchecked_mut(x as usize) = gp_raw };
+        }
+        x = p;
+    }
+}
+
+#[inline(always)]
+fn union_min_zero_st(
+    parent: &mut [u32],
+    keys: &[u64],
+    overflow: &OverflowInterner,
+    a: u32,
+    b: u32,
+) {
+    let mut u = find_root_zero_st(parent, a);
+    let mut v = find_root_zero_st(parent, b);
+    if u == v {
+        return;
+    }
+    let ku = unsafe { *keys.get_unchecked(u as usize) };
+    let kv = unsafe { *keys.get_unchecked(v as usize) };
+    if overflow.cmp_user_key(kv, ku) == Ordering::Less {
+        std::mem::swap(&mut u, &mut v);
+    }
+    unsafe { *parent.get_unchecked_mut(v as usize) = u + 1 };
+}
+
+struct LinkSinkSt<'a> {
+    keys: &'a mut [u64],
+    parent: &'a mut [u32],
+    mask: usize,
+    overflow: &'a OverflowInterner,
+    num_nodes: usize,
+    max_nodes: usize,
+    overflowed: bool,
+    has_edges: bool,
+    edge_batch: [(u64, u64); 32],
+    batch_len: usize,
+}
+
+impl<'a> LinkSinkSt<'a> {
+    #[inline]
+    fn flush_batch(&mut self) {
+        for &(ka, kb) in &self.edge_batch[..self.batch_len] {
+            prefetch_addr(unsafe { self.keys.as_ptr().add((mix64(ka) as usize) & self.mask) });
+            prefetch_addr(unsafe { self.keys.as_ptr().add((mix64(kb) as usize) & self.mask) });
+        }
+        for &(ka, kb) in &self.edge_batch[..self.batch_len] {
+            if self.overflowed {
+                return;
+            }
+            let Some(ia) = intern_node_st(
+                self.keys,
+                self.mask,
+                ka,
+                &mut self.num_nodes,
+                self.max_nodes,
+            ) else {
+                self.overflowed = true;
+                return;
+            };
+            let Some(ib) = intern_node_st(
+                self.keys,
+                self.mask,
+                kb,
+                &mut self.num_nodes,
+                self.max_nodes,
+            ) else {
+                self.overflowed = true;
+                return;
+            };
+            union_min_zero_st(self.parent, self.keys, self.overflow, ia, ib);
+        }
+    }
+
+    #[inline(always)]
+    fn push_pair(&mut self, a: &[u8], b: &[u8]) {
+        let (ka, kb) = pack_b37_pair(a, b'u', b, b'u')
+            .unwrap_or_else(|| (self.overflow.encode_user(a), self.overflow.encode_user(b)));
+        if ka != kb {
+            self.has_edges = true;
+            self.edge_batch[self.batch_len] = (ka, kb);
+            self.batch_len += 1;
+            if self.batch_len == 32 {
+                self.flush_batch();
+                self.batch_len = 0;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn flush_tail(&mut self) {
+        if self.batch_len > 0 && !self.overflowed {
+            self.flush_batch();
+        }
+        self.batch_len = 0;
+    }
+}
+
+impl CsvRowSink<2> for LinkSinkSt<'_> {
+    #[inline(always)]
+    unsafe fn on_pos(&mut self, ptr: *const u8, s0: usize, rpos: *const u16) {
+        if self.overflowed {
+            return;
+        }
+        let e0 = *rpos as usize;
+        let q0 = usize::from(*ptr.add(s0) == b'"');
+        let a_len = (e0 - s0) - (q0 << 1);
+        if a_len == 0 {
+            return;
+        }
+        let e1 = *rpos.add(1) as usize;
+        let s1 = e0 + 1;
+        let q1 = usize::from(*ptr.add(s1) == b'"');
+        let b_len = (e1 - s1) - (q1 << 1);
+        if b_len == 0 {
+            return;
+        }
+        let a = std::slice::from_raw_parts(ptr.add(s0 + q0), a_len);
+        let b = std::slice::from_raw_parts(ptr.add(s1 + q1), b_len);
+        self.push_pair(a, b);
+    }
+
+    #[inline(always)]
+    fn on_row(&mut self, &[a, b]: &[&[u8]; 2]) {
+        if self.overflowed {
+            return;
+        }
+        if !a.is_empty() && !b.is_empty() {
+            self.push_pair(a, b);
+        }
+    }
+}
+
+#[inline(always)]
+fn insert_bucket6_st(
+    buckets: &mut [Bucket6],
+    bitset: &mut [u64],
+    num_buckets: usize,
+    wmask: usize,
+    key: u64,
+    encoded_val: u64,
+    h: u64,
+    local_ov: &mut Vec<(u64, u64, u64)>,
+) {
+    let (w, m) = bloom_word_and_mask(h, wmask);
+    unsafe { *bitset.get_unchecked_mut(w) |= m };
+
+    if num_buckets > 0 && key < B37_LIMIT {
+        let home = bucket6_index(h, num_buckets);
+        if encoded_val < B37_LIMIT {
+            let tag = bucket6_tag(h);
+            let mut bidx = home;
+            for step in 0..BUCKET6_MAX_PROBE {
+                let b = unsafe { buckets.get_unchecked_mut(bidx) };
+                let slot = (b.meta & BUCKET_CNT_MASK) as usize;
+                if slot < 6 {
+                    b.tags[slot] = tag;
+                    b.vals_lo[slot] = encoded_val as u32;
+                    b.vals_hi[slot] = (encoded_val >> 32) as u16;
+                    b.meta += 1;
+                    return;
+                }
+                if step + 1 < BUCKET6_MAX_PROBE {
+                    b.meta |= BUCKET_PROBED_NEXT;
+                    bidx += 1;
+                    if bidx >= num_buckets {
+                        bidx = 0;
+                    }
+                }
+            }
+        }
+        unsafe { buckets.get_unchecked_mut(home) }.meta |= BUCKET_HAS_OVERFLOW;
+    }
+    local_ov.push((key, encoded_val, h));
+}
+
+fn build_link_redirect_st(
+    mmaps: Vec<Mmap>,
+    jobs: Vec<(usize, usize, usize)>,
+    total_link_bytes: usize,
+    cap: usize,
+    mask: usize,
+    max_nodes: usize,
+    overflow: &OverflowInterner,
+) -> LinkRedirect {
+    let mut keys: HugeZeroed<u64> = HugeZeroed::new(cap);
+    let mut parent: HugeZeroed<u32> = HugeZeroed::new(cap);
+
+    let (overflowed, has_edges) = {
+        let mut sink = LinkSinkSt {
+            keys: keys.as_mut_slice(),
+            parent: parent.as_mut_slice(),
+            mask,
+            overflow,
+            num_nodes: 0,
+            max_nodes,
+            overflowed: false,
+            has_edges: false,
+            edge_batch: [(0u64, 0u64); 32],
+            batch_len: 0,
+        };
+        for &(fidx, start, end) in &jobs {
+            if sink.overflowed {
+                break;
+            }
+            scan_csv_mmap_chunk_sink::<2, _>(&mmaps[fidx], start, end, &mut sink);
+            sink.flush_tail();
+        }
+        (sink.overflowed, sink.has_edges)
+    };
+
+    if overflowed {
+        drop(keys);
+        drop(parent);
+        return build_link_redirect_fallback(&mmaps, &jobs, 1, overflow);
+    }
+
+    if !has_edges {
+        if total_link_bytes < 256 * 1024 * 1024 {
+            std::mem::forget(keys);
+            std::mem::forget(parent);
+            std::mem::forget(mmaps);
+        }
+        return LinkRedirect::empty();
+    }
+
+    let mut num_redirects = 0usize;
+    {
+        let p_sl = parent.as_mut_slice();
+        for i in 0..cap {
+            let p_raw = unsafe { *p_sl.get_unchecked(i) };
+            if p_raw != 0 {
+                let mut r = (p_raw - 1) as usize;
+                loop {
+                    let pr = unsafe { *p_sl.get_unchecked(r) };
+                    if pr == 0 {
+                        break;
+                    }
+                    r = (pr - 1) as usize;
+                }
+                if r + 1 != p_raw as usize {
+                    unsafe { *p_sl.get_unchecked_mut(i) = (r + 1) as u32 };
+                }
+                num_redirects += 1;
+            }
+        }
+    }
+
+    let (num_buckets, num_words, wmask) = redirect_table_dims(num_redirects);
+    let mut buckets: HugeZeroed<Bucket6> = HugeZeroed::new(num_buckets);
+    let mut bitset: HugeZeroed<u64> = HugeZeroed::new(num_words);
+    let mut local_ov: Vec<(u64, u64, u64)> = Vec::new();
+
+    {
+        let p_sl = parent.as_slice();
+        let k_sl = keys.as_slice();
+        let b_sl = buckets.as_mut_slice();
+        let bs_sl = bitset.as_mut_slice();
+        let mut batch = [(0u64, 0usize, 0u64); 32];
+        let mut blen = 0usize;
+        for i in 0..cap {
+            let p_raw = unsafe { *p_sl.get_unchecked(i) };
+            if p_raw != 0 {
+                let key = unsafe { *k_sl.get_unchecked(i) };
+                let h = link_hash(key);
+                let root_idx = (p_raw - 1) as usize;
+                prefetch_addr(unsafe { k_sl.as_ptr().add(root_idx) });
+                prefetch_addr(unsafe { bs_sl.as_ptr().add((h as usize) & wmask) });
+                if num_buckets > 0 && key < B37_LIMIT {
+                    prefetch_addr(unsafe { b_sl.as_ptr().add(bucket6_index(h, num_buckets)) });
+                }
+                batch[blen] = (key, root_idx, h);
+                blen += 1;
+                if blen == 32 {
+                    for &(k, ridx, kh) in &batch {
+                        let canon = unsafe { *k_sl.get_unchecked(ridx) };
+                        insert_bucket6_st(
+                            b_sl,
+                            bs_sl,
+                            num_buckets,
+                            wmask,
+                            k,
+                            encode_canon_val(canon),
+                            kh,
+                            &mut local_ov,
+                        );
+                    }
+                    blen = 0;
+                }
+            }
+        }
+        for &(k, ridx, kh) in &batch[..blen] {
+            let canon = unsafe { *k_sl.get_unchecked(ridx) };
+            insert_bucket6_st(
+                b_sl,
+                bs_sl,
+                num_buckets,
+                wmask,
+                k,
+                encode_canon_val(canon),
+                kh,
+                &mut local_ov,
+            );
+        }
+    }
+
+    let (overflow_slots, ov_mask) = if !local_ov.is_empty() {
+        let ov_cap = overflow_table_cap(local_ov.len());
+        let ov_mask = ov_cap - 1;
+        let mut ov_slots: HugeZeroed<RedirectSlot> = HugeZeroed::new(ov_cap);
+        let ov_sl = ov_slots.as_mut_slice();
+        for &(k, ev, h) in &local_ov {
+            let mut idx = ((h >> 16) as usize) & ov_mask;
+            while unsafe { ov_sl.get_unchecked(idx) }.key != EMPTY_KEY {
+                idx = (idx + 1) & ov_mask;
+            }
+            unsafe {
+                *ov_sl.get_unchecked_mut(idx) = RedirectSlot { key: k, val: ev };
+            }
+        }
+        (ov_slots, ov_mask)
+    } else {
+        (HugeZeroed::new(0), 0)
+    };
+
+    if total_link_bytes < 256 * 1024 * 1024 {
+        std::mem::forget(keys);
+        std::mem::forget(parent);
+        std::mem::forget(mmaps);
+    }
+
+    LinkRedirect {
+        bitset,
+        wmask,
+        buckets,
+        num_buckets,
+        overflow_slots,
+        ov_mask,
+    }
+}
+
 pub fn build_link_redirect(
     link_files: &[PathBuf],
     num_threads: usize,
@@ -510,6 +1126,18 @@ pub fn build_link_redirect(
     let cap = ((total_link_bytes / 12).max(4096)).next_power_of_two();
     let mask = cap - 1;
     let max_nodes = (cap * 3) / 4;
+
+    if nt == 1 {
+        return build_link_redirect_st(
+            mmaps,
+            jobs,
+            total_link_bytes,
+            cap,
+            mask,
+            max_nodes,
+            overflow,
+        );
+    }
 
     let keys: HugeZeroed<AtomicU64> = HugeZeroed::new(cap);
     let parent: HugeZeroed<AtomicU32> = HugeZeroed::new(cap);
@@ -624,8 +1252,8 @@ pub fn build_link_redirect(
     });
 
     let num_redirects = redirect_count.into_inner();
-    let res = finalize_redirect_table(num_redirects, |asl, abs, smask, wmask| {
-        // Pass 2b: Batched-prefetch scatter (key -> encoded_canon) into flat redirect table
+    let res = finalize_redirect_table(num_redirects, nt, |buckets, abs, num_buckets, wmask| {
+        // Pass 2b: Batched-prefetch scatter (key -> encoded_canon) into 6-slot AVX2 buckets
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(nt);
             for t in 0..nt {
@@ -637,6 +1265,7 @@ pub fn build_link_redirect(
                 let p_ref: &[AtomicU32] = &parent;
                 let k_ref: &[AtomicU64] = &keys;
                 handles.push(s.spawn(move || {
+                    let mut local_ov: Vec<(u64, u64, u64)> = Vec::new();
                     let mut batch = [(0u64, 0usize, 0u64); 32];
                     let mut blen = 0usize;
                     for i in start..end {
@@ -647,23 +1276,26 @@ pub fn build_link_redirect(
                             let root_idx = (p_raw - 1) as usize;
                             prefetch_addr(unsafe { k_ref.as_ptr().add(root_idx) });
                             prefetch_addr(unsafe { abs.as_ptr().add((h as usize) & wmask) });
-                            prefetch_addr(unsafe {
-                                asl.as_ptr().add(((h >> 16) as usize) & smask)
-                            });
+                            if num_buckets > 0 && key < B37_LIMIT {
+                                prefetch_addr(unsafe {
+                                    buckets.as_ptr().add(bucket6_index(h, num_buckets))
+                                });
+                            }
                             batch[blen] = (key, root_idx, h);
                             blen += 1;
                             if blen == 32 {
                                 for &(k, ridx, kh) in &batch {
                                     let canon = unsafe { k_ref.get_unchecked(ridx) }
                                         .load(MemOrdering::Relaxed);
-                                    insert_redirect_slot_with_hash(
-                                        asl,
+                                    insert_bucket6_with_hash(
+                                        buckets,
                                         abs,
-                                        smask,
+                                        num_buckets,
                                         wmask,
                                         k,
                                         encode_canon_val(canon),
                                         kh,
+                                        &mut local_ov,
                                     );
                                 }
                                 blen = 0;
@@ -674,23 +1306,23 @@ pub fn build_link_redirect(
                         for &(k, ridx, kh) in &batch[..blen] {
                             let canon = unsafe { k_ref.get_unchecked(ridx) }
                                 .load(MemOrdering::Relaxed);
-                            insert_redirect_slot_with_hash(
-                                asl,
+                            insert_bucket6_with_hash(
+                                buckets,
                                 abs,
-                                smask,
+                                num_buckets,
                                 wmask,
                                 k,
                                 encode_canon_val(canon),
                                 kh,
+                                &mut local_ov,
                             );
                         }
                     }
+                    local_ov
                 }));
             }
-            for h in handles {
-                h.join().unwrap();
-            }
-        });
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
     });
 
     if total_link_bytes < 256 * 1024 * 1024 {
@@ -1007,7 +1639,7 @@ fn build_link_redirect_fallback(
     drop(parent);
 
     let num_redirects = redirect_count.into_inner();
-    finalize_redirect_table(num_redirects, |asl, abs, smask, wmask| {
+    finalize_redirect_table(num_redirects, flat_threads, |buckets, abs, num_buckets, wmask| {
         std::thread::scope(|s| {
             let mut handles = Vec::new();
             let mut offset = 0usize;
@@ -1016,18 +1648,26 @@ fn build_link_redirect_fallback(
                 offset += chunk.len();
                 let ak = &all_keys;
                 handles.push(s.spawn(move || {
+                    let mut local_ov: Vec<(u64, u64, u64)> = Vec::new();
                     for (j, &r) in chunk.iter().enumerate() {
                         let i = start_i + j;
                         if (r as usize) != i {
-                            insert_redirect_slot(asl, abs, smask, wmask, ak[i], ak[r as usize]);
+                            insert_bucket6_canon(
+                                buckets,
+                                abs,
+                                num_buckets,
+                                wmask,
+                                ak[i],
+                                ak[r as usize],
+                                &mut local_ov,
+                            );
                         }
                     }
+                    local_ov
                 }));
             }
-            for h in handles {
-                h.join().unwrap();
-            }
-        });
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
     })
 }
 
@@ -1153,7 +1793,7 @@ mod tests {
         ] {
             let k = overflow.encode_user(s);
             let h = checker.prefetch_bloom_for(k);
-            let slotted = match checker.bloom_hit_slot_with_hash(h) {
+            let slotted = match checker.bloom_hit_slot_with_hash(k, h) {
                 Some(idx) => decode_canon_val(checker.resolve_from_slot_hashed(k, h, idx)),
                 None => k,
             };
@@ -1164,8 +1804,88 @@ mod tests {
         let empty = LinkRedirect::empty();
         let k0 = overflow.encode_user(b"u1234567");
         assert!(empty.is_empty());
-        assert_eq!(empty.bloom_hit_slot_with_hash(empty.prefetch_bloom_for(k0)), None);
+        assert_eq!(
+            empty.bloom_hit_slot_with_hash(k0, empty.prefetch_bloom_for(k0)),
+            None
+        );
         assert_eq!(empty.resolve(k0), k0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_redirect_bucket6_large_and_overflow_parity() {
+        let dir = std::env::temp_dir().join("shopping_links_bucket6_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("large.csv");
+        let mut keys_raw: Vec<String> = Vec::with_capacity(26_000);
+        {
+            let mut w = File::create(&f).unwrap();
+            writeln!(w, "user_id_a,user_id_b").unwrap();
+            // 25_000 redirects triggering Bucket6 (>= BUCKET6_MIN_REDIRECTS) plus uppercase/long overflow keys
+            for i in 0..25_000usize {
+                let a = format!("u{:07}", i * 2 + 1);
+                let b = if i % 50 == 0 {
+                    // Uppercase B37_LIMIT+ canon triggers canon >= B37_LIMIT overflow path inside Bucket6
+                    format!("U{:07}", i * 2)
+                } else {
+                    format!("u{:07}", i * 2)
+                };
+                writeln!(w, "{a},{b}").unwrap();
+                keys_raw.push(a);
+                keys_raw.push(b);
+            }
+            // Chains and >9 byte keys mixed in
+            for i in 0..200usize {
+                let a = format!("long_member_{i:04}");
+                let b = format!("u{:07}", i * 2);
+                writeln!(w, "{a},{b}").unwrap();
+                keys_raw.push(a);
+            }
+            // Extra uppercase chain onto one existing root
+            writeln!(w, "u0000010,Upper000000").unwrap();
+            keys_raw.push("Upper000000".to_string());
+        }
+
+        let overflow = OverflowInterner::new();
+        let lr = build_link_redirect(&[f.clone()], 4, &overflow);
+        let lr_st = build_link_redirect(&[f.clone()], 1, &overflow);
+        assert!(lr.num_buckets >= BUCKET6_MIN_BUCKETS, "expected Bucket6 path active");
+        assert_eq!(lr_st.num_buckets, lr.num_buckets, "ST Bucket6 geometry mismatch");
+
+        let mmaps: Vec<Mmap> =
+            vec![unsafe { MmapOptions::new().map(&File::open(&f).unwrap()).unwrap() }];
+        let jobs = vec![(0, 0, mmaps[0].len())];
+        let lr_fb = build_link_redirect_fallback(&mmaps, &jobs, 4, &overflow);
+
+        // Verify parity across all linked keys + unlinked probes between MT slotted, ST slotted, resolve(), and fallback
+        for i in 0..500usize {
+            keys_raw.push(format!("unlinked_{i:04}"));
+            keys_raw.push(format!("u9{:07}", i));
+        }
+        for s in &keys_raw {
+            let k = overflow.encode_user(s.as_bytes());
+            let h = lr.prefetch_bloom_for(k);
+            let slotted = match lr.bloom_hit_slot_with_hash(k, h) {
+                Some(idx) => {
+                    lr.prefetch_slot(idx);
+                    decode_canon_val(lr.resolve_from_slot_hashed(k, h, idx))
+                }
+                None => k,
+            };
+            let slotted_st = match lr_st.bloom_hit_slot_with_hash(k, h) {
+                Some(idx) => decode_canon_val(lr_st.resolve_from_slot_hashed(k, h, idx)),
+                None => k,
+            };
+            let resolved = lr.resolve(k);
+            let resolved_st = lr_st.resolve(k);
+            let fb_resolved = lr_fb.resolve(k);
+            assert_eq!(slotted, resolved, "slotted != resolve for {s}");
+            assert_eq!(slotted_st, resolved_st, "st slotted != st resolve for {s}");
+            assert_eq!(resolved_st, fb_resolved, "st bucket6 != fallback for {s}");
+            assert_eq!(resolved, fb_resolved, "bucket6 != fallback for {s}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
